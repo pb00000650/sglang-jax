@@ -119,9 +119,10 @@ class ServerArgs:
     jax_proc_id: int = None
     jax_num_procs: int = None
 
-    xla_backend: str = "tpu"
+    xla_backend: str = "native"
+    print(f"************{xla_backend}")
     # Kernel backend
-    attention_backend: Optional[str] = "fa"
+    attention_backend: Optional[str] = "native"
 
     max_seq_len: int = 4096
 

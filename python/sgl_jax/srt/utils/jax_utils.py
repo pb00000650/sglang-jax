@@ -58,6 +58,18 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
             stats = dev.memory_stats()
             avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
         avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
+    elif device == "cuda":
+        import pynvml
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+        avail_mem = []
+        for i in range(device_count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            avail = mem_info.free
+            avail_mem.append(avail)
+            print(f"CUDA device {i} available memory: {avail / (1 << 20):.2f} MB")  # 调试打印信息
+        avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
     elif device == "cpu":
         import psutil
 
