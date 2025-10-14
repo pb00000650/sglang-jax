@@ -59,16 +59,37 @@ def get_available_device_memory(device, distributed=False, empty_cache=True):
             avail_mem.append(stats["bytes_limit"] - stats["bytes_in_use"])
         avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
     elif device == "cuda":
-        import pynvml
-        pynvml.nvmlInit()
-        device_count = pynvml.nvmlDeviceGetCount()
+        devices = jax.local_devices()
+        cuda_devices = [dev for dev in devices if dev.platform in ("cuda", "gpu")]
+        if not cuda_devices:
+            raise RuntimeError("No CUDA devices found")
+
+        if empty_cache:
+            jax.clear_caches()
+
         avail_mem = []
-        for i in range(device_count):
-            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            avail = mem_info.free
+        for i, dev in enumerate(cuda_devices):
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                avail = mem_info.free
+                pynvml.nvmlShutdown()
+            except Exception as e:
+                print(f"Warning: pynvml memory query failed: {e}, using fallback")
+                try:
+                    stats = dev.memory_stats()
+                    total_mem = stats.get("bytes_limit", stats.get("bytes_total", 0))
+                    used_mem = stats.get("bytes_in_use", 0)
+                    avail = total_mem - used_mem
+                except:
+                    avail = 4 * (1024 **3)  # 4GB保守估计
+
             avail_mem.append(avail)
-            print(f"CUDA device {i} available memory: {avail / (1 << 20):.2f} MB")  # 调试打印信息
+            print(f"CUDA device {i} 可用内存: {avail / (1 << 20):.2f} MB")
+
+        # 新增：将列表转换为jnp.array，与tpu分支保持一致
         avail_mem = jnp.array([min(avail_mem) / (1 << 10)], dtype=jnp.float32)
     elif device == "cpu":
         import psutil
