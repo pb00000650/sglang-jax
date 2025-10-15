@@ -101,7 +101,7 @@ class RadixCache(BasePrefixCache):
         self.num_processes = jax.process_count()
         self.local_devices = jax.local_device_count()
 
-        self.cpu_device = jax.local_devices()[0]
+        self.cpu_device = jax.local_devices(backend="cpu")[0]
 
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1

@@ -12,7 +12,6 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
@@ -149,7 +148,6 @@ class Qwen2Attention(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
     ) -> jax.Array:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
@@ -160,7 +158,7 @@ class Qwen2Attention(nnx.Module):
         v = v.reshape(-1, self.kv_head_num, self.head_dim)
 
         q, k = self.rotary_emb(positions, q, k)
-        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
+        attn_output, kv_fused = self.attn(q, k, v, forward_batch=forward_batch)
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
@@ -220,7 +218,6 @@ class Qwen2DecoderLayer(nnx.Module):
         positions: jax.Array,
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
         residual: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, jax.Array]:
         layer_callback_flag = []
@@ -236,7 +233,6 @@ class Qwen2DecoderLayer(nnx.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
-            token_to_kv_pool=token_to_kv_pool,
         )
 
         hidden_states += residual
@@ -284,7 +280,6 @@ class Qwen2Model(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
     ):
         residual = None
         hidden_states = self.embed_tokens(forward_batch.input_ids)
@@ -292,11 +287,7 @@ class Qwen2Model(nnx.Module):
         layers_callback_flag = []
         for layer in self.layers:
             hidden_states, residual, kv_fused, callback_flag = layer(
-                forward_batch.positions,
-                hidden_states,
-                forward_batch,
-                token_to_kv_pool,
-                residual,
+                forward_batch.positions, hidden_states, forward_batch, residual
             )
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
@@ -459,11 +450,10 @@ class Qwen2ForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
     ):
         hidden_states, layers_kv_fused, layers_callback_flag = self.transformer(
-            forward_batch, token_to_kv_pool
+            forward_batch
         )
         output = self.logits_processor(hidden_states, logits_metadata)
         return output, layers_kv_fused, layers_callback_flag
