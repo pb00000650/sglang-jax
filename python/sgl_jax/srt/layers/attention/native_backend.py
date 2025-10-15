@@ -8,7 +8,7 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
-from sgl_jax.srt.mem_cache.memory_pool import merge_kv
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, merge_kv
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
@@ -51,6 +51,7 @@ class NativeAttention(AttentionBackend):
         v: jax.Array,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
     ):
         """
         Args:
@@ -61,7 +62,7 @@ class NativeAttention(AttentionBackend):
             Tuple of (output tensor of shape [total_tokens, hidden_size], k, v)
         """
         k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
-            k, v, forward_batch, layer.layer_id
+            k, v, forward_batch, token_to_kv_pool, layer.layer_id
         )
 
         if layer.scaling is None:
@@ -99,28 +100,27 @@ class NativeAttention(AttentionBackend):
         k: jax.Array,
         v: jax.Array,
         forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
         layer_id: int,
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
         """
         Get the kv cache from the forward batch.
         """
-        layer_idx = layer_id - forward_batch.token_to_kv_pool.start_layer
-
         if is_tpu_runtime():
             if forward_batch.forward_mode == ForwardMode.EXTEND:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                token_to_kv_pool.set_kv_buffer(
                     layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
                 )
             else:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                token_to_kv_pool.set_kv_buffer(
                     layer_id, forward_batch.out_cache_loc, k, v, is_decode=True
                 )
             # Use fused layer directly from pool; derive K/V views without extra merge
-            fused_layer = forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer_id)
+            fused_layer = token_to_kv_pool.get_fused_kv_buffer(layer_id)
             k, v = fused_layer[:, ::2, :], fused_layer[:, 1::2, :]
             fused_return = fused_layer
         else:
-            updated_layer = forward_batch.token_to_kv_pool.set_kv_buffer_legacy(
+            updated_layer = token_to_kv_pool.set_kv_buffer_legacy(
                 layer_id, forward_batch.out_cache_loc, k, v
             )
             # Functional style: treat updated_layer as authoritative fused buffer for this layer in this step

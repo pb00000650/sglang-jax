@@ -149,7 +149,7 @@ class WeightLoader:
                 filename = os.path.basename(st_file)
                 pbar.set_postfix({"file": filename})
 
-                with jax.default_device(jax.local_devices(backend="cuda")[0]):
+                with jax.default_device(jax.local_devices(backend="cpu")[0]):
                     with safe_open(st_file, framework="flax") as f:
                         needed_keys = []
                         for name in f.keys():
