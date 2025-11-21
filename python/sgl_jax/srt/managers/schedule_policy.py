@@ -5,7 +5,7 @@ import random
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Union, Tuple
 
 from jax import numpy as jnp
 
@@ -16,6 +16,7 @@ from sgl_jax.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from PIL import Image
 
 import logging
 
@@ -48,6 +49,13 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 IGNORE_EOS_RESERVE_TOKENS = 1
 
 
+class ModalityType(Enum):
+    """多模态类型枚举"""
+    TEXT = "text"
+    IMAGE = "image"
+    AUDIO = "audio"
+
+
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
 
@@ -61,6 +69,48 @@ class CacheAgnosticPolicy(Enum):
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
     RANDOM = "random"
+
+
+class MultiModalReq(Req):
+    """扩展请求类以支持多模态输入"""
+    def __init__(
+        self,
+        # 继承原有参数
+        rid: str,
+        origin_input_text: str,
+        origin_input_ids: list[int],
+        sampling_params: SamplingParams,
+        # 新增多模态参数
+        multimodal_inputs: List[Tuple[ModalityType, Union[List[int], Image, str]]] = None,  # (类型, 数据)
+        **kwargs
+    ):
+        super().__init__(
+            rid=rid,
+            origin_input_text=origin_input_text,
+            origin_input_ids=origin_input_ids,
+            sampling_params=sampling_params,** kwargs
+        )
+        self.multimodal_inputs = multimodal_inputs or []
+        # 多模态前缀特征（如图像嵌入哈希值）
+        self.modal_prefix_features: List[str] = self._extract_modal_features()
+
+    def _extract_modal_features(self) -> List[str]:
+        """提取多模态输入的特征标识（用于前缀匹配）"""
+        features = []
+        for modal_type, data in self.multimodal_inputs:
+            if modal_type == ModalityType.IMAGE:
+                # 示例：使用图像哈希作为特征标识
+                features.append(f"img_{hash(data.tobytes())}")
+            elif modal_type == ModalityType.AUDIO:
+                # 示例：使用音频特征哈希
+                features.append(f"aud_{hash(data)}")
+        return features
+
+    def adjust_max_prefix_ids(self) -> List[Union[int, str]]:
+        """扩展前缀ID为多模态混合类型（文本token + 模态特征）"""
+        text_prefix = super().adjust_max_prefix_ids()
+        # 组合文本前缀和多模态特征（确保可哈希用于前缀树）
+        return [*self.modal_prefix_features, *text_prefix]
 
 
 class SchedulePolicy:
@@ -82,7 +132,40 @@ class SchedulePolicy:
             disable=False,
         )
 
-    def calc_priority(self, waiting_queue: list[Req]) -> bool:
+    def _compute_prefix_matches(
+        self, waiting_queue: list[MultiModalReq], policy: CacheAwarePolicy
+    ) -> set[int]:
+        """扩展前缀匹配逻辑以支持多模态"""
+        temporary_deprioritized: set[int] = set()
+        self.waiting_queue_radix_tree.reset()
+
+        for r in waiting_queue:
+            # 多模态前缀（包含模态特征和文本token）
+            prefix_ids = r.adjust_max_prefix_ids()
+
+            # 匹配前缀时同时考虑多模态特征
+            r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
+                self.tree_cache.match_prefix(rid=r.rid, key=prefix_ids)
+            )
+
+            # 多模态批内前缀缓存检查
+            if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+                in_batch_matching_prefixes, _, _, _ = self.waiting_queue_radix_tree.match_prefix(
+                    rid=r.rid, key=prefix_ids
+                )
+                if (
+                    len(in_batch_matching_prefixes)
+                    >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
+                ):
+                    temporary_deprioritized.add(r.rid)
+                else:
+                    self.waiting_queue_radix_tree.insert(
+                        prefix_ids, jnp.empty(len(prefix_ids), dtype=jnp.bool_)
+                    )
+        return temporary_deprioritized
+
+    # 保留原有方法，将参数类型适配为MultiModalReq...
+    def calc_priority(self, waiting_queue: list[MultiModalReq]) -> bool:
         if self.policy == CacheAgnosticPolicy.FCFS:
             # A shortcut for FCFS
             return False
@@ -451,16 +534,22 @@ class PrefillAdder:
 
         return self.budget_state()
 
-    def add_one_req(self, req: Req):
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+    def add_one_req(self, req: MultiModalReq):
+        """扩展以支持多模态请求的内存分配"""
+        # 计算多模态输入的额外内存开销（如图像嵌入的token等价物）
+        modal_token_overhead = sum(
+            10  # 示例：每个图像/音频转换为10个"虚拟token"的内存开销
+            for modal_type, _ in req.multimodal_inputs
+            if modal_type in (ModalityType.IMAGE, ModalityType.AUDIO)
+        )
 
-        total_tokens = req.extend_input_len + min(
+        # 总令牌数 = 文本令牌 + 多模态虚拟令牌 + 生成令牌
+        total_tokens = (req.extend_input_len + modal_token_overhead) + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len - req.host_hit_length
+        real_input_tokens = (req.extend_input_len - req.host_hit_length) + modal_token_overhead
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
@@ -471,11 +560,10 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
             req.last_matched_prefix_len = prefix_len
-            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+            input_tokens = self.ceil_paged_tokens(req.extend_input_len + modal_token_overhead)
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
@@ -503,8 +591,8 @@ class PrefillAdder:
                     return AddReqResult.OTHER
 
                 # Chunked prefill
-                req.extend_input_len = trunc_len
-                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+                req.extend_input_len = trunc_len - modal_token_overhead  # 扣除多模态开销
+                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req

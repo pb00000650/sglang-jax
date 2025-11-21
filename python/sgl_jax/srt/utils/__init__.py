@@ -13,4 +13,5 @@ from .common_utils import (
     prepare_model_and_tokenizer,
     set_ulimit,
     set_uvicorn_logging_configs,
+    ImageData,
 )

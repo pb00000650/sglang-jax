@@ -245,10 +245,26 @@ class ChatCompletionMessageContentImageURL(BaseModel):
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
+    duration: int | None = None  # 视频时长（秒）
+    frame_rate: float | None = None  # 帧率
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
     url: str
+    duration: int | None = None  # 音频时长（秒）
+    sample_rate: int | None = None  # 采样率
+
+
+class ChatCompletionMessageContentDocumentURL(BaseModel):
+    url: str
+    format: Literal["pdf", "docx", "txt", "csv"] | None = None  # 文档格式
+    page_numbers: list[int] | None = None  # 指定页码
+
+
+class ChatCompletionMessageContent3DModelURL(BaseModel):
+    url: str
+    format: Literal["glb", "gltf", "obj", "stl"] | None = None  # 3D模型格式
+    dimensions: tuple[float, float, float] | None = None  # 模型尺寸
 
 
 class ChatCompletionMessageContentImagePart(BaseModel):
@@ -260,11 +276,25 @@ class ChatCompletionMessageContentImagePart(BaseModel):
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
     video_url: ChatCompletionMessageContentVideoURL
+    modalities: Literal["video", "multi-videos"] | None = "video"
 
 
 class ChatCompletionMessageContentAudioPart(BaseModel):
     type: Literal["audio_url"]
     audio_url: ChatCompletionMessageContentAudioURL
+    modalities: Literal["audio", "multi-audios"] | None = "audio"
+
+
+class ChatCompletionMessageContentDocumentPart(BaseModel):
+    type: Literal["document_url"]
+    document_url: ChatCompletionMessageContentDocumentURL
+    modalities: Literal["document", "multi-documents"] | None = "document"
+
+
+class ChatCompletionMessageContent3DModelPart(BaseModel):
+    type: Literal["3d_model_url"]
+    model_url: ChatCompletionMessageContent3DModelURL
+    modalities: Literal["3d_model", "multi-3d-models"] | None = "3d_model"
 
 
 ChatCompletionMessageContentPart = (
@@ -272,6 +302,8 @@ ChatCompletionMessageContentPart = (
     | ChatCompletionMessageContentImagePart
     | ChatCompletionMessageContentVideoPart
     | ChatCompletionMessageContentAudioPart
+    | ChatCompletionMessageContentDocumentPart
+    | ChatCompletionMessageContent3DModelPart
 )
 
 

@@ -333,9 +333,10 @@ def top_p_normalize_probs_jax(
 def _apply_min_p_filter(operands):
     """Apply min_p filtering when need_min_p_sampling=True"""
     inputs, min_ps, use_probs = operands
-    max_per_bs = jnp.max(inputs, axis=1)
-    min_p_thresholds = max_per_bs * min_ps
-    min_p_mask = inputs < min_p_thresholds.reshape(-1, 1)
+    # 确保max_per_bs的维度与inputs匹配（保留批次维度，对词汇表维度求最大值）
+    max_per_bs = jnp.max(inputs, axis=-1, keepdims=True)  # 形状变为 [batch_size, ..., 1]
+    min_p_thresholds = max_per_bs * min_ps.reshape(*min_ps.shape, 1)  # 扩展维度以匹配inputs
+    min_p_mask = inputs < min_p_thresholds  # 现在形状兼容，可直接比较
     return jnp.where(min_p_mask, 0.0, inputs)
 
 

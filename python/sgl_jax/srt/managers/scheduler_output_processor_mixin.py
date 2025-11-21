@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import jax
 
@@ -67,6 +67,12 @@ class SchedulerOutputProcessorMixin:
                     logits_output.input_token_logprobs = tuple(
                         jax.device_get(logits_output.input_token_logprobs).astype(float)
                     )
+                # 处理多模态输入的logprobs
+                if logits_output.multimodal_logprobs is not None:
+                    logits_output.multimodal_logprobs = jax.device_get(
+                        logits_output.multimodal_logprobs
+                    ).astype(float)
+
         # Check finish conditions
         logprob_pt = 0
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
@@ -324,8 +330,14 @@ class SchedulerOutputProcessorMixin:
 
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
-            if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(logits_output.hidden_states[i])
+                
+            # 处理多模态隐藏状态
+            if req.return_hidden_states:
+                if logits_output.hidden_states is not None:
+                    req.hidden_states.append(logits_output.hidden_states[i])
+                if logits_output.multimodal_hidden_states is not None and req.has_multimodal_input:
+                    req.multimodal_hidden_states.append(logits_output.multimodal_hidden_states[i])
+
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob, cache_miss_count=cache_miss_count)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -346,7 +358,7 @@ class SchedulerOutputProcessorMixin:
         output: LogitsProcessorOutput,
         logprob_pt: int,
         num_input_logprobs: int,
-        last_prefill_chunk: bool,  # If True, it means prefill is finished.
+        last_prefill_chunk: bool,
     ):
         """Incrementally add input logprobs to `req`.
 
@@ -372,6 +384,11 @@ class SchedulerOutputProcessorMixin:
         if req.temp_input_token_ids_logprobs_idx is None:
             req.temp_input_token_ids_logprobs_idx = []
 
+        # 初始化多模态logprobs存储
+        if req.has_multimodal_input and req.return_logprob:
+            if req.multimodal_logprobs is None:
+                req.multimodal_logprobs = []
+
         if req.input_token_logprobs_val is not None:
             # The input logprob has been already computed. It only happens
             # upon retract.
@@ -382,6 +399,11 @@ class SchedulerOutputProcessorMixin:
         input_token_logprobs: tuple[int] = output.input_token_logprobs
         input_token_logprobs = input_token_logprobs[logprob_pt : logprob_pt + num_input_logprobs]
         req.input_token_logprobs.extend(input_token_logprobs)
+
+        # 处理多模态logprobs
+        if req.has_multimodal_input and req.return_logprob and output.multimodal_logprobs is not None:
+            multimodal_logprobs = output.multimodal_logprobs[logprob_pt : logprob_pt + num_input_logprobs]
+            req.multimodal_logprobs.extend(multimodal_logprobs)
 
         if req.top_logprobs_num > 0:
             req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
@@ -414,6 +436,11 @@ class SchedulerOutputProcessorMixin:
                 x if x < self.model_config.vocab_size - 1 else 0 for x in input_token_logprobs_idx
             ]
             req.input_token_logprobs_idx = input_token_logprobs_idx
+
+            # 处理多模态logprobs最终值
+            if req.has_multimodal_input and req.return_logprob:
+                req.multimodal_logprobs_val = req.multimodal_logprobs
+                req.multimodal_logprobs = None
 
             if req.top_logprobs_num > 0:
                 req.input_top_logprobs_val = [None]
@@ -517,6 +544,11 @@ class SchedulerOutputProcessorMixin:
         read_offsets = []
         output_ids = []
 
+        # 多模态相关字段
+        multimodal_inputs = []
+        multimodal_types = []
+        multimodal_metadata = []
+
         skip_special_tokens = []
         spaces_between_special_tokens = []
         no_stop_trim = []
@@ -525,7 +557,8 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         spec_verify_ct = []
         spec_accepted_tokens = []
-        output_hidden_states = None
+        output_hidden_states = []
+        multimodal_hidden_states = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -540,6 +573,8 @@ class SchedulerOutputProcessorMixin:
             input_token_ids_logprobs_idx = []
             output_token_ids_logprobs_val = []
             output_token_ids_logprobs_idx = []
+            # 多模态logprobs字段
+            multimodal_logprobs_val = []
         else:
             input_token_logprobs_val = input_token_logprobs_idx = output_token_logprobs_val = (
                 output_token_logprobs_idx
@@ -547,7 +582,7 @@ class SchedulerOutputProcessorMixin:
                 output_top_logprobs_idx
             ) = input_token_ids_logprobs_val = input_token_ids_logprobs_idx = (
                 output_token_ids_logprobs_val
-            ) = output_token_ids_logprobs_idx = None
+            ) = output_token_ids_logprobs_idx = multimodal_logprobs_val = None
 
         for req in reqs:
             if req is skip_req:
@@ -601,9 +636,18 @@ class SchedulerOutputProcessorMixin:
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
 
+                # 收集多模态信息
+                multimodal_inputs.append(req.multimodal_inputs if req.has_multimodal_input else None)
+                multimodal_types.append(req.multimodal_types if req.has_multimodal_input else None)
+                multimodal_metadata.append(req.multimodal_metadata if req.has_multimodal_input else None)
+                multimodal_hidden_states.append(req.multimodal_hidden_states if req.has_multimodal_input else None)
+
                 if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
+
+                # 收集隐藏状态
+                output_hidden_states.append(req.hidden_states)
 
                 if return_logprob:
                     if req.return_logprob and not req.input_logprob_sent:
@@ -613,6 +657,8 @@ class SchedulerOutputProcessorMixin:
                         input_top_logprobs_idx.append(req.input_top_logprobs_idx)
                         input_token_ids_logprobs_val.append(req.input_token_ids_logprobs_val)
                         input_token_ids_logprobs_idx.append(req.input_token_ids_logprobs_idx)
+                        # 多模态logprobs
+                        multimodal_logprobs_val.append(req.multimodal_logprobs_val if req.has_multimodal_input else None)
                         req.input_logprob_sent = True
                     else:
                         input_token_logprobs_val.append([])
@@ -621,6 +667,7 @@ class SchedulerOutputProcessorMixin:
                         input_top_logprobs_idx.append([])
                         input_token_ids_logprobs_val.append([])
                         input_token_ids_logprobs_idx.append([])
+                        multimodal_logprobs_val.append(None)
 
                     if req.return_logprob:
                         output_token_logprobs_val.append(
@@ -679,5 +726,11 @@ class SchedulerOutputProcessorMixin:
                 output_token_ids_logprobs_idx,
                 output_hidden_states,
                 cache_miss_count,
+                # 新增多模态字段
+                multimodal_inputs=multimodal_inputs,
+                multimodal_types=multimodal_types,
+                multimodal_metadata=multimodal_metadata,
+                multimodal_hidden_states=multimodal_hidden_states,
+                multimodal_logprobs_val=multimodal_logprobs_val if return_logprob else None,
             )
             self.send_to_detokenizer.send_pyobj(out)

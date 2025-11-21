@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import jax
 from jax.sharding import NamedSharding, PartitionSpec
@@ -36,6 +36,14 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+
+
+class MediaType(IntEnum):
+    """Types of media in multi-modal inputs"""
+    TEXT = auto()
+    IMAGE = auto()
+    AUDIO = auto()
+    VIDEO = auto()
 
 
 class ForwardMode(IntEnum):
@@ -127,10 +135,25 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
+@dataclass
+class MediaInfo:
+    """Information about multi-modal media in the batch"""
+    # Type of media (image, audio, etc.)
+    media_type: MediaType
+    # Indices of requests that contain this media
+    req_indices: jax.Array
+    # Shapes of media data for each request [num_media, ...]
+    shapes: jax.Array
+    # Positions where media is inserted in the input sequence [num_media]
+    positions: jax.Array
+    # Total number of media elements in the batch
+    count: int
+
+
 @register_pytree_node_class
 @dataclass
 class ForwardBatch:
-    """Store all inputs of a forward pass."""
+    """Store all inputs of a forward pass, including multi-modal data"""
 
     # The batch id
     bid: int
@@ -166,6 +189,18 @@ class ForwardBatch:
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 
+    # Multi-modal data
+    # Image data [total_image_patches] or [num_images, channels, height, width]
+    image_data: Optional[jax.Array] = None
+    # Audio data [total_audio_frames] or [num_audios, channels, frames]
+    audio_data: Optional[jax.Array] = None
+    # Video data [total_video_frames * patches] or [num_videos, frames, channels, height, width]
+    video_data: Optional[jax.Array] = None
+    # Metadata about media in the batch
+    media_info: Optional[MediaInfo] = None
+    # Mapping from media positions to token positions [num_media]
+    media_to_token_mapping: Optional[jax.Array] = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -179,6 +214,12 @@ class ForwardBatch:
             self.extend_prefix_lens,
             self.extend_seq_lens,
             self.spec_info,
+            self.image_data,
+            self.audio_data,
+            self.video_data,
+            self.media_to_token_mapping,
+            (self.media_info.req_indices, self.media_info.shapes, self.media_info.positions) 
+            if self.media_info else None,
         )
 
         aux_data = {
@@ -186,6 +227,10 @@ class ForwardBatch:
             "batch_size": self.batch_size,
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
+            "trace_request_ids": self.trace_request_ids,
+            "trace_request_objects": self.trace_request_objects,
+            "media_type_count": self.media_info.media_type.value if self.media_info else None,
+            "media_count": self.media_info.count if self.media_info else 0,
         }
         return (children, aux_data)
 
@@ -197,8 +242,8 @@ class ForwardBatch:
         obj.batch_size = aux_data["batch_size"]
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
-        obj.trace_request_ids = None
-        obj.trace_request_objects = None
+        obj.trace_request_ids = aux_data["trace_request_ids"]
+        obj.trace_request_objects = aux_data["trace_request_objects"]
 
         obj.input_ids = children[0]
         obj.req_pool_indices = children[1]
@@ -211,6 +256,24 @@ class ForwardBatch:
         obj.extend_prefix_lens = children[8]
         obj.extend_seq_lens = children[9]
         obj.spec_info = children[10]
+        obj.image_data = children[11]
+        obj.audio_data = children[12]
+        obj.video_data = children[13]
+        obj.media_to_token_mapping = children[14]
+
+        # Reconstruct media info if present
+        media_data = children[15]
+        if media_data is not None and aux_data["media_type_count"] is not None:
+            obj.media_info = MediaInfo(
+                media_type=MediaType(aux_data["media_type_count"]),
+                req_indices=media_data[0],
+                shapes=media_data[1],
+                positions=media_data[2],
+                count=aux_data["media_count"]
+            )
+        else:
+            obj.media_info = None
+
         return obj
 
     def __repr__(self) -> str:
@@ -226,13 +289,22 @@ class ForwardBatch:
             "cache_loc",
             "extend_prefix_lens",
             "extend_seq_lens",
+            "image_data",
+            "audio_data",
+            "video_data",
+            "media_to_token_mapping",
         ]:
             value = getattr(self, field_name, None)
             if value is not None and isinstance(value, jax.Array):
                 jax_array_fields.append(f"{field_name}={value.shape}")
 
+        # Add media info if present
+        media_str = ""
+        if self.media_info:
+            media_str = f", media_type={self.media_info.media_type}, media_count={self.media_info.count}"
+
         jax_arrays_str = ", ".join(jax_array_fields)
-        return f"ForwardBatch(forward_mode={self.forward_mode}, batch_size={self.batch_size}, {jax_arrays_str})"
+        return f"ForwardBatch(forward_mode={self.forward_mode}, batch_size={self.batch_size}, {jax_arrays_str}{media_str})"
 
     @classmethod
     def init_new(
@@ -240,6 +312,7 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        # Process text and common fields
         (
             input_ids,
             seq_lens,
@@ -250,6 +323,13 @@ class ForwardBatch:
             cache_loc,
             extend_prefix_lens,
             extend_seq_lens,
+            image_data,
+            audio_data,
+            video_data,
+            media_to_token_mapping,
+            media_req_indices,
+            media_shapes,
+            media_positions,
         ) = device_array(
             (
                 batch.input_ids,
@@ -261,6 +341,13 @@ class ForwardBatch:
                 batch.cache_loc,
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
+                batch.image_data if hasattr(batch, 'image_data') else None,
+                batch.audio_data if hasattr(batch, 'audio_data') else None,
+                batch.video_data if hasattr(batch, 'video_data') else None,
+                batch.media_to_token_mapping if hasattr(batch, 'media_to_token_mapping') else None,
+                batch.media_req_indices if hasattr(batch, 'media_req_indices') else None,
+                batch.media_shapes if hasattr(batch, 'media_shapes') else None,
+                batch.media_positions if hasattr(batch, 'media_positions') else None,
             ),
             sharding=(
                 NamedSharding(model_runner.mesh, PartitionSpec())
@@ -268,6 +355,17 @@ class ForwardBatch:
                 else None
             ),
         )
+
+        # Create media info if available
+        media_info = None
+        if hasattr(batch, 'media_type') and batch.media_type is not None:
+            media_info = MediaInfo(
+                media_type=batch.media_type,
+                req_indices=media_req_indices,
+                shapes=media_shapes,
+                positions=media_positions,
+                count=batch.media_count if hasattr(batch, 'media_count') else 0
+            )
 
         obj = cls(
             bid=batch.bid,
@@ -286,6 +384,11 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
+            image_data=image_data,
+            audio_data=audio_data,
+            video_data=video_data,
+            media_info=media_info,
+            media_to_token_mapping=media_to_token_mapping,
         )
 
         return obj

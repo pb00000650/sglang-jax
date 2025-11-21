@@ -34,6 +34,20 @@ logger = logging.getLogger(__name__)
 DETOKENIZER_MAX_STATES = int(os.environ.get("SGLANG_DETOKENIZER_MAX_STATES", 1 << 16))
 
 
+class LimitedCapacityDict(OrderedDict):
+    """A dictionary with a limited capacity that evicts the oldest item when full."""
+    def __init__(self, capacity: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.capacity = capacity
+
+    def __setitem__(self, key, value):
+        if len(self) >= self.capacity:
+            # Remove the oldest element (first item in the dict)
+            self.popitem(last=False)
+        # Set the new item
+        super().__setitem__(key, value)
+
+
 @dataclasses.dataclass
 class DecodeStatus:
     """Store the status of incremental decoding."""
@@ -85,11 +99,13 @@ class DetokenizerManager:
     def event_loop(self):
         """The event loop that handles requests"""
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
-
-            output = self._request_dispatcher(recv_obj)
-            # if recv_obj is not None:
-            self.send_to_tokenizer.send_pyobj(output)
+            try:
+                recv_obj = self.recv_from_scheduler.recv_pyobj()
+                output = self._request_dispatcher(recv_obj)
+                self.send_to_tokenizer.send_pyobj(output)
+            except Exception as e:
+                logger.error(f"Error in detokenizer event loop: {get_exception_traceback()}")
+                # Continue processing other requests even if one fails
 
     def trim_matched_stop(self, output: str | list[int], finished_reason: dict, no_stop_trim: bool):
         if no_stop_trim or not finished_reason:
@@ -250,7 +266,7 @@ class DetokenizerManager:
             processed_new_token_ids = process_special_tokens_spaces(
                 new_token_ids,
                 recv_obj.skip_special_tokens[i],
-                self.tokenizer.all_special_ids,
+                self.tokenizer.all_special_ids if self.tokenizer else None,
             )
 
             # Incrementally send text.
@@ -294,19 +310,6 @@ def process_special_tokens_spaces(
     return [token for token in token_ids if token not in all_special_ids]
 
 
-class LimitedCapacityDict(OrderedDict):
-    def __init__(self, capacity: int, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.capacity = capacity
-
-    def __setitem__(self, key, value):
-        if len(self) >= self.capacity:
-            # Remove the oldest element (first item in the dict)
-            self.popitem(last=False)
-        # Set the new item
-        super().__setitem__(key, value)
-
-
 def run_detokenizer_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -322,7 +325,8 @@ def run_detokenizer_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error("DetokenizerManager hit an exception: %s", traceback)
-        parent_process.send_signal(signal.SIGQUIT)
+        if parent_process.is_running():
+            parent_process.send_signal(signal.SIGQUIT)
 
 
 def run_detokenizer_thread(

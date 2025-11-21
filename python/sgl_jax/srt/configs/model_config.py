@@ -64,8 +64,7 @@ class ModelConfig:
             self.model_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
-            model_override_args=self.model_override_args,
-            **kwargs,
+            model_override_args=self.model_override_args,** kwargs,
         )
 
         self.hf_generation_config = get_generation_config(
@@ -86,9 +85,23 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
-        # Check model type
+
+        # # Qwen2.5-VL架构名称修正（多模态适配）
+        # is_qwen25_vl = (
+        #     "Qwen2.5-VL" in model_path 
+        #     or (self.hf_config.architectures and "Qwen2_5_VLForConditionalGeneration" in self.hf_config.architectures)
+        # )
+        # if is_qwen25_vl:
+        #     self.hf_config.architectures = ["Qwen2_5VLForCausalLM"]
+        #     if self.hf_text_config and hasattr(self.hf_text_config, "architectures"):
+        #         self.hf_text_config.architectures = ["Qwen2_5VLForCausalLM"]
+        #     logger.info("Qwen2.5-VL架构名称已修正为: %s", self.hf_config.architectures)
+
+        # 多模态模型识别与配置
+        self._init_multimodal_config()
+
+        # 模型类型判断（生成式/嵌入式）
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
-        self.is_multimodal = False
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length
@@ -97,14 +110,14 @@ class ModelConfig:
             if context_length > derived_context_len:
                 if get_bool_env_var("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", default="True"):
                     logger.warning(
-                        "Warning: User-specified context_length (%s) is greater than the derived context_length (%s). This may lead to incorrect model outputs or CUDA errors.",
+                        "Warning: User-specified context_length (%s) is greater than the derived context_length (%s).",
                         context_length,
                         derived_context_len,
                     )
                     self.context_len = context_length
                 else:
                     raise ValueError(
-                        f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+                        f"User-specified context_length ({context_length}) exceeds derived length ({derived_context_len})."
                     )
             else:
                 self.context_len = context_length
@@ -117,7 +130,6 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
-
         self.attention_arch = AttentionArch.MHA
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(self.hf_text_config, "num_key_value_heads", None)
@@ -139,7 +151,7 @@ class ModelConfig:
                 raise ValueError(f"model_layer_nums must be positive, got {model_layer_nums}")
             if model_layer_nums > self.num_hidden_layers:
                 logger.warning(
-                    "model_layer_nums (%s) is greater than the original num_hidden_layers (%s). Using original value.",
+                    "model_layer_nums (%s) exceeds original num_hidden_layers (%s). Using original value.",
                     model_layer_nums,
                     self.num_hidden_layers,
                 )
@@ -151,21 +163,61 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
 
+        # 多模态专用参数
+        self._init_multimodal_specific_params()
+
+    def _init_multimodal_config(self):
+        """初始化多模态模型标识及基础配置"""
+        # 判断是否为多模态模型
+        self.is_multimodal = (
+            any(arch in multimodal_model_archs for arch in self.hf_config.architectures)
+            or hasattr(self.hf_config, "vision_config")
+            or hasattr(self.hf_config, "image_config")
+            or hasattr(self.hf_config, "multimodal_config")
+        )
+
+        if self.is_multimodal:
+            logger.info(
+                "检测到多模态模型，架构: %s，模型类型: %s",
+                self.hf_config.architectures,
+                self.hf_config.model_type,
+            )
+
+    def _init_multimodal_specific_params(self):
+        """初始化多模态模型专用参数"""
         config = self.hf_config
 
         # multimodal
         self.image_token_id = getattr(config, "image_token_id", None) or getattr(
             config, "image_token_index", None
         )
+        if self.is_multimodal and self.image_token_id is None:
+            logger.warning("多模态模型未找到image_token_id配置，可能导致图像输入处理失败")
+
+        # 视觉编码器配置（如Qwen2-VL、LLaVA等）
+        self.vision_config = getattr(config, "vision_config", None)
+        self.vision_num_hidden_layers = getattr(
+            self.hf_config.vision_config,
+            "num_hidden_layers",
+            getattr(self.hf_config.vision_config, "num_layers", 24)  # 替代字段或默认值
+        )
+        self.vision_hidden_size = getattr(self.vision_config, "hidden_size", None) if self.vision_config else None
+
+        # 多模态融合配置（如交叉注意力层数量）
+        self.cross_attention_layers = getattr(config, "cross_attention_layers", None)
+
+        # 图像处理参数（如输入尺寸）
+        self.image_size = getattr(config, "image_size", None) or getattr(
+            self.vision_config, "image_size", (224, 224)  # 默认图像尺寸
+        )
 
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
         model_path: str = None,
-        model_revision: str = None,
-        **kwargs,
+        model_revision: str = None,** kwargs,
     ):
-        return ModelConfig(
+        model_config = ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
@@ -178,6 +230,14 @@ class ModelConfig:
             model_layer_nums=server_args.model_layer_nums,
             **kwargs,
         )
+        # 多模态模型配置打印（调试用）
+        if model_config.is_multimodal:
+            print("\n=== 多模态模型配置详情 ===")
+            print(f"架构: {model_config.hf_config.architectures}")
+            print(f"图像Token ID: {model_config.image_token_id}")
+            print(f"视觉编码器隐藏层尺寸: {model_config.vision_hidden_size}")
+            print(f"图像输入尺寸: {model_config.image_size}")
+        return model_config
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
