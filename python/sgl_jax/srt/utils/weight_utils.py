@@ -27,8 +27,35 @@ class WeightMapping:
     kv_head_padding: bool = False
     concat_axis: int | None = None
     is_eagle3: bool = False
-    # 新增：支持多模态权重类型标记
-    modality: str = "text"  # 可选值: "text", "image", "audio"
+
+    def __post_init__(self):
+        if self.sharding is None:
+            self.sharding = self._infer_default_sharding()
+
+    def _infer_default_sharding(self) -> tuple:
+        path = self.target_path[0] if isinstance(self.target_path, list) else self.target_path
+
+        if any(pattern in path for pattern in ["embedding", "lm_head"]):
+            return (None, None)
+        elif any(
+            pattern in path
+            for pattern in [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "w1",
+                "w2",
+                "gate_proj",
+                "up_proj",
+            ]
+        ):
+            return (None, "tensor")
+        elif any(pattern in path for pattern in ["c_proj", "o_proj", "down_proj"]):
+            return ("tensor", None)
+        elif "bias" in path or "weight" in path:
+            return (None,)
+        else:
+            return (None,)
 
 
 class WeightLoader:
@@ -45,9 +72,10 @@ class WeightLoader:
         self.dtype = dtype
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
 
-        # 文本模态基础参数
         self.num_heads = model_config.num_attention_heads
-        self.num_kv_heads = model_config.get_total_num_kv_heads()
+        self.num_kv_heads = (
+            model_config.get_total_num_kv_heads()
+        )  # Use original count for replication logic
         self.hidden_size = model_config.hidden_size
         self.head_dim_original = getattr(
             model_config, "head_dim", self.hidden_size // self.num_heads
@@ -55,14 +83,11 @@ class WeightLoader:
 
         self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
         self.head_dim = self.head_dim_original
-        self.sharding_size = self.mesh.shape["tensor"] if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape else 1
+        if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
+            self.sharding_size = self.mesh.shape["tensor"]
+        else:
+            self.sharding_size = 1
 
-        # 多模态配置
-        self.is_multimodal = getattr(model_config, "is_multimodal", False)
-        self.image_encoder_hidden_size = getattr(model_config, "image_encoder_hidden_size", None)
-        self.image_patch_size = getattr(model_config, "image_patch_size", 16)
-        
-        # MoE配置
         if hasattr(model_config, "ep_size") and model_config.ep_size > 1:
             world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
             tp_size = world_size // model_config.ep_size
@@ -74,57 +99,44 @@ class WeightLoader:
         else:
             self.moe_abstract_mesh = None
 
-        # 多模态权重映射处理函数注册
-        self.modality_handlers = {
-            "text": self._process_text_weight,
-            "image": self._process_image_weight,
-            "audio": self._process_audio_weight,
-        }
-
     def load_weights_from_safetensors(
         self,
         weight_mappings: dict[str, str | list[str] | WeightMapping],
         safetensors_partition=1,
         dummy=False,
     ):
+        """Load weights from safetensors files or generate dummy weights.
+
+        Args:
+            weight_mappings: Mapping from HF keys to model paths with sharding info
+            safetensors_partition: Number of safetensors partitions
+            dummy: If True, generate random weights instead of loading from files
+        """
         params = nnx.state(self.model)
 
+        # Dummy mode: generate random weights using mapping's sharding info
+        # Can be explicitly passed or set via model_config._dummy_mode
         if dummy or self.dummy_mode:
             self._load_dummy_weights(params, weight_mappings)
             return
 
         regular_mappings = {}
         moe_mappings = {}
-        multimodal_mappings = {}
 
-        # 分离不同模态的权重映射
         for key, mapping in weight_mappings.items():
             if key.startswith("__MOE_EXPERTS__"):
                 moe_mappings[key] = mapping
             else:
-                if isinstance(mapping, WeightMapping) and mapping.modality != "text":
-                    multimodal_mappings[key] = mapping
-                else:
-                    regular_mappings[key] = mapping
+                regular_mappings[key] = mapping
 
         moe_buffer = {}
 
         logger.info(
-            "WeightLoader: Will load layers 0 to %s (multimodal: %s)",
+            "WeightLoader: Will load layers 0 to %s",
             self.model_config.num_hidden_layers - 1,
-            self.is_multimodal
         )
 
         for hf_key, hf_weight in self._iterate_weights():
-            # 优先处理多模态权重
-            if hf_key in multimodal_mappings:
-                mapping = multimodal_mappings[hf_key]
-                if isinstance(mapping, (str, list)):
-                    mapping = WeightMapping(target_path=mapping)
-                handler = self.modality_handlers.get(mapping.modality, self._process_text_weight)
-                handler(params, hf_key, hf_weight, mapping)
-                continue
-
             if hf_key in regular_mappings:
                 if hf_key == "d2t":
                     base = jnp.arange(hf_weight.shape[0], dtype=hf_weight.dtype)
@@ -134,17 +146,17 @@ class WeightLoader:
                 mapping = regular_mappings[hf_key]
                 if isinstance(mapping, (str, list)):
                     mapping = WeightMapping(target_path=mapping)
-                self._process_text_weight(params, hf_key, hf_weight, mapping)
-            
-            # MoE权重处理保持不变
-            elif ("mlp.experts." in hf_key or "block_sparse_moe.experts" in hf_key) and hf_key.endswith(".weight"):
+                self._process_and_assign_weight(params, hf_key, hf_weight, mapping)
+            elif (
+                "mlp.experts." in hf_key or "block_sparse_moe.experts" in hf_key
+            ) and hf_key.endswith(".weight"):
                 if self._is_excluded_layer_weight(hf_key):
                     logger.debug("Skipping excluded MoE expert weight: %s", hf_key)
                     continue
 
                 assigned = False
                 for moe_key, mapping in moe_mappings.items():
-                    expected_hf_keys = mapping.target_path[1:]
+                    expected_hf_keys = mapping.target_path[1:]  # list of expected HF keys
                     if hf_key in expected_hf_keys:
                         if moe_key not in moe_buffer:
                             moe_buffer[moe_key] = {}
@@ -155,20 +167,27 @@ class WeightLoader:
 
                         if len(moe_buffer[moe_key]) == len(expected_hf_keys):
                             shard_counts = [len(v) for v in moe_buffer[moe_key].values()]
+                            # Validate all weights have consistent shard counts
                             if len(set(shard_counts)) != 1:
                                 continue
 
+                            # Auto-detect TP sharding:
+                            # - Grok-2: concat_axis is set, needs multiple shards (e.g., 8)
                             if mapping.concat_axis is not None:
+                                # TP-sharded weights: need to collect all TP shards
+                                # Expected number of shards = total model files / experts per file
                                 if shard_counts[0] < safetensors_partition:
+                                    # Still collecting shards, wait for more
                                     continue
                             else:
+                                # Non-TP-sharded weights: expect exactly 1 copy per expert
                                 if shard_counts[0] != 1:
                                     continue
 
                             self._process_single_moe_group(
                                 params, moe_key, mapping, moe_buffer[moe_key]
                             )
-                            del moe_buffer[moe_key]
+                            del moe_buffer[moe_key]  # free memory
                         break
 
                 if not assigned:
@@ -184,113 +203,46 @@ class WeightLoader:
                 mapping = moe_mappings[moe_key]
                 expected = len(mapping.target_path[1:])
                 got = len(moe_buffer[moe_key])
-                shard_counts = [len(v) for v in moe_buffer[moe_key].values()] if moe_buffer[moe_key] else []
+                shard_counts = (
+                    [len(v) for v in moe_buffer[moe_key].values()] if moe_buffer[moe_key] else []
+                )
                 logger.error(
                     "MoE group %s incomplete: %s/%s weights loaded, shard_counts=%s, concat_axis=%s",
-                    moe_key, got, expected, shard_counts, mapping.concat_axis,
+                    moe_key,
+                    got,
+                    expected,
+                    shard_counts,
+                    mapping.concat_axis,
                 )
             raise RuntimeError("Incomplete MoE expert weights detected.")
 
         nnx.update(self.model, params)
 
-    # 新增：文本权重处理（原处理逻辑迁移至此）
-    def _process_text_weight(self, params: nnx.State, hf_key: str, hf_weight: jax.Array, mapping: WeightMapping):
-        processed_weight = hf_weight
-
-        if mapping.transpose and not hf_key.endswith(".bias"):
-            processed_weight = jnp.transpose(processed_weight, (1, 0))
-
-        if isinstance(mapping.target_path, list):
-            self._handle_split_weight(params, hf_key, processed_weight, mapping)
-        else:
-            self._handle_single_weight(params, hf_key, processed_weight, mapping)
-
-    # 新增：图像权重处理
-    def _process_image_weight(self, params: nnx.State, hf_key: str, hf_weight: jax.Array, mapping: WeightMapping):
-        processed_weight = hf_weight
-
-        # 图像编码器权重转置处理（通常与文本不同）
-        if mapping.transpose and not hf_key.endswith(".bias"):
-            # 卷积层权重通常是 (out_channels, in_channels, kernel_size, kernel_size)
-            if len(processed_weight.shape) == 4:  # 卷积层
-                processed_weight = jnp.transpose(processed_weight, (2, 3, 1, 0))  # 转为 (H, W, in, out)
-            else:  # 线性层
-                processed_weight = jnp.transpose(processed_weight, (1, 0))
-
-        # 图像补丁嵌入层特殊处理
-        if "patch_embedding" in hf_key or "conv_proj" in hf_key:
-            processed_weight = self._reshape_patch_embedding(processed_weight)
-
-        # 应用分块
-        sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
-
-        try:
-            model_param = self._get_param(params, mapping.target_path)
-            logger.debug(
-                "Loading image weight %s -> %s, shape: %s",
-                hf_key, mapping.target_path, processed_weight.shape,
-            )
-            model_param.value = sharded_weight.astype(model_param.value.dtype)
-        except Exception as e:
-            logger.error("Failed to load image weight %s -> %s: %s", hf_key, mapping.target_path, str(e))
-            raise
-
-    # 新增：音频权重处理（示例实现）
-    def _process_audio_weight(self, params: nnx.State, hf_key: str, hf_weight: jax.Array, mapping: WeightMapping):
-        processed_weight = hf_weight
-
-        # 音频特征层通常需要转置
-        if mapping.transpose and not hf_key.endswith(".bias"):
-            processed_weight = jnp.transpose(processed_weight, (1, 0))
-
-        # 音频梅尔谱图投影层处理
-        if "mel_proj" in hf_key:
-            processed_weight = jnp.reshape(
-                processed_weight, 
-                (self.image_encoder_hidden_size, -1)  # 适配音频特征维度
-            )
-
-        sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
-
-        try:
-            model_param = self._get_param(params, mapping.target_path)
-            model_param.value = sharded_weight.astype(model_param.value.dtype)
-        except Exception as e:
-            logger.error("Failed to load audio weight %s -> %s: %s", hf_key, mapping.target_path, str(e))
-            raise
-
-    # 新增：图像补丁嵌入层重塑
-    def _reshape_patch_embedding(self, weight: jax.Array) -> jax.Array:
-        """将卷积补丁嵌入权重重塑为匹配模型预期的形状"""
-        if self.image_encoder_hidden_size is None:
-            return weight
-
-        # 假设原始权重形状: (out_channels, in_channels, kernel_h, kernel_w)
-        if len(weight.shape) == 4:
-            out_channels, in_channels, kernel_h, kernel_w = weight.shape
-            # 重塑为 (patch_size^2 * in_channels, out_channels)
-            return jnp.reshape(weight, (in_channels * kernel_h * kernel_w, out_channels))
-        return weight
-
-    # 以下方法保持不变，但需要兼容多模态权重
-    def _process_single_moe_group(self, params: nnx.State, moe_key: str, mapping: WeightMapping, expert_weights_dict: dict[str, list[jax.Array]]):
-        # 保持原有实现...
+    def _process_single_moe_group(
+        self,
+        params: nnx.State,
+        moe_key: str,
+        mapping: WeightMapping,
+        expert_weights_dict: dict[str, list[jax.Array]],
+    ):
         target_path = mapping.target_path[0]
         expected_hf_keys = mapping.target_path[1:]
 
         collected_weights = []
         for hf_key in expected_hf_keys:
             weights = expert_weights_dict[hf_key]
+            # If TP-sharded (e.g., Grok-2), concatenate shards along concat_axis
             if mapping.concat_axis is not None and len(weights) > 1:
                 weight = jnp.concatenate(weights, axis=mapping.concat_axis)
             else:
+                # Non-TP-sharded (e.g., Qwen3-MoE), expect single weight
                 weight = weights[0]
 
             if mapping.transpose and not hf_key.endswith(".bias"):
                 weight = jnp.transpose(weight, (1, 0))
             collected_weights.append(weight)
 
-        stacked_weight = jnp.stack(collected_weights, axis=0)
+        stacked_weight = jnp.stack(collected_weights, axis=0)  # (num_experts, ...)
 
         if "expert" in mapping.sharding:
             ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
@@ -311,94 +263,186 @@ class WeightLoader:
 
         logger.debug("Assigned MoE group %s, shape: %s", moe_key, stacked_weight.shape)
 
-    def _load_dummy_weights(self, params: nnx.State, weight_mappings: dict[str, str | list[str] | WeightMapping], seed: int = 1234):
-        # 扩展虚拟权重生成以支持多模态
-        logger.info("Generating dummy weights (multimodal: %s)", self.is_multimodal)
+    def _load_dummy_weights(
+        self,
+        params: nnx.State,
+        weight_mappings: dict[str, str | list[str] | WeightMapping],
+        seed: int = 1234,
+    ):
+        logger.info("Generating dummy weights with proper sharding from weight mappings")
+        # Separate regular and MOE weights
         regular_mappings = {}
         moe_mappings = {}
-        multimodal_mappings = {}
 
         for hf_key, mapping in weight_mappings.items():
             if hf_key.startswith("__MOE_EXPERTS__"):
                 moe_mappings[hf_key] = mapping
             else:
-                if isinstance(mapping, WeightMapping) and mapping.modality != "text":
-                    multimodal_mappings[hf_key] = mapping
-                else:
-                    regular_mappings[hf_key] = mapping
+                regular_mappings[hf_key] = mapping
 
-        # 处理文本权重
+        # Process regular weights
         for hf_key, mapping in regular_mappings.items():
-            # 保持原有实现...
+
             if isinstance(mapping, (str, list)):
                 mapping = WeightMapping(target_path=mapping)
 
-            target_path = mapping.target_path if isinstance(mapping.target_path, str) else mapping.target_path[0]
+            target_path = (
+                mapping.target_path
+                if isinstance(mapping.target_path, str)
+                else mapping.target_path[0]
+            )
 
             try:
                 model_param = self._get_param(params, target_path)
             except (KeyError, AttributeError, ValueError):
-                logger.debug("Skip dummy weight for %s", target_path)
+                logger.debug("Skip dummy weight for %s (parameter not found)", target_path)
                 continue
 
             shape = model_param.value.shape
             dtype = model_param.value.dtype
+
+            # Generate dummy weight with correct sharding
             sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
             sharding = jax.sharding.NamedSharding(self.mesh, sharding_spec)
 
             def make_shard(indices, shape=shape, dtype=dtype):
-                shard_shape = [stop - start for dim_size, idx in zip(shape, indices) 
-                              if isinstance(idx, slice) and (start:=idx.start or 0) < (stop:=idx.stop or dim_size)]
+                # Compute shard shape from global shape and indices
+                shard_shape = []
+                for dim_size, idx in zip(shape, indices):
+                    if isinstance(idx, slice):
+                        start, stop, step = idx.indices(dim_size)
+                        assert step == 1, f"Non-unit step not supported: {idx}"
+                        shard_shape.append(stop - start)
+                    else:
+                        shard_shape.append(1)
+                shard_shape = tuple(shard_shape)
+
+                # Generate random data
                 rng = np.random.default_rng(seed)
                 if jnp.issubdtype(dtype, jnp.floating):
-                    gen_dtype = np.float32 if dtype == jnp.bfloat16 else dtype
-                    return jnp.asarray(rng.uniform(-1e-3, 1e-3, size=tuple(shard_shape)).astype(gen_dtype), dtype=dtype)
-                return jnp.zeros(tuple(shard_shape), dtype=dtype)
+                    if dtype == jnp.bfloat16:
+                        gen_dtype = np.float32
+                    else:
+                        gen_dtype = {
+                            jnp.float16: np.float16,
+                            jnp.float32: np.float32,
+                            jnp.float64: np.float64,
+                        }.get(dtype, np.float32)
+                    arr_np = rng.uniform(-1e-3, 1e-3, size=shard_shape).astype(gen_dtype)
+                    return jnp.asarray(arr_np, dtype=dtype)
+                else:
+                    # Non-floating types, just zeros
+                    return jnp.zeros(shard_shape, dtype=dtype)
 
             dummy_weight = jax.make_array_from_callback(shape, sharding, make_shard)
             model_param.value = dummy_weight
+            logger.debug(
+                "Generated dummy weight for %s, shape=%s, sharding=%s",
+                target_path,
+                shape,
+                sharding_spec,
+            )
 
-        # 处理多模态虚拟权重
-        for hf_key, mapping in multimodal_mappings.items():
+        # Process MOE weights
+        for moe_key, mapping in moe_mappings.items():
             if isinstance(mapping, (str, list)):
-                mapping = WeightMapping(target_path=mapping, modality="image")  # 默认图像模态
+                mapping = WeightMapping(target_path=mapping)
 
-            target_path = mapping.target_path if isinstance(mapping.target_path, str) else mapping.target_path[0]
+            target_path = mapping.target_path[0]
+
             try:
                 model_param = self._get_param(params, target_path)
             except (KeyError, AttributeError, ValueError):
-                logger.debug("Skip dummy multimodal weight for %s", target_path)
+                logger.debug("Skip dummy MOE weight for %s (parameter not found)", target_path)
                 continue
 
-            shape = model_param.value.shape
+            # Expected shape: (num_experts, ...)
+            full_shape = model_param.value.shape
+            num_experts = full_shape[0]
+            expert_weight_shape = full_shape[1:]
             dtype = model_param.value.dtype
-            sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
-            sharding = jax.sharding.NamedSharding(self.mesh, sharding_spec)
 
-            # 为图像权重生成不同分布的随机值（更符合视觉特征）
-            def make_multimodal_shard(indices, shape=shape, dtype=dtype):
-                shard_shape = [stop - start for dim_size, idx in zip(shape, indices) 
-                              if isinstance(idx, slice) and (start:=idx.start or 0) < (stop:=idx.stop or dim_size)]
-                rng = np.random.default_rng(seed + 1000)  # 偏移种子避免与文本权重相同
-                if jnp.issubdtype(dtype, jnp.floating):
-                    # 视觉权重通常方差更小
-                    gen_dtype = np.float32 if dtype == jnp.bfloat16 else dtype
-                    return jnp.asarray(rng.normal(0, 1e-4, size=tuple(shard_shape)).astype(gen_dtype), dtype=dtype)
-                return jnp.zeros(tuple(shard_shape), dtype=dtype)
+            # Generate dummy weights for all experts
+            collected_weights = []
+            for expert_idx in range(num_experts):
+                # For each expert weight, generate with appropriate sharding
+                # Remove "expert" axis from sharding for individual expert weight generation
+                if mapping.sharding and "expert" in mapping.sharding:
+                    # Expert-parallel sharding: use tensor-only sharding for generation
+                    expert_sharding_tuple = tuple(s for s in mapping.sharding if s != "expert")
+                else:
+                    expert_sharding_tuple = mapping.sharding
 
-            dummy_weight = jax.make_array_from_callback(shape, sharding, make_multimodal_shard)
-            model_param.value = dummy_weight
-            logger.debug("Generated dummy %s weight for %s, shape=%s", mapping.modality, target_path, shape)
+                expert_sharding_spec = P(*expert_sharding_tuple) if expert_sharding_tuple else P()
+                expert_sharding = jax.sharding.NamedSharding(self.mesh, expert_sharding_spec)
 
-        # 处理MoE权重（保持不变）
-        # ...
+                def make_expert_shard(
+                    indices, weight_shape=expert_weight_shape, weight_dtype=dtype, idx=expert_idx
+                ):
+                    shard_shape = []
+                    for dim_size, idx_val in zip(weight_shape, indices):
+                        if isinstance(idx_val, slice):
+                            start, stop, step = idx_val.indices(dim_size)
+                            assert step == 1, f"Non-unit step not supported: {idx_val}"
+                            shard_shape.append(stop - start)
+                        else:
+                            shard_shape.append(1)
+                    shard_shape = tuple(shard_shape)
+
+                    rng = np.random.default_rng(seed + idx)
+                    if jnp.issubdtype(weight_dtype, jnp.floating):
+                        gen_dtype = np.float32 if weight_dtype == jnp.bfloat16 else weight_dtype
+                        arr_np = rng.uniform(-1e-3, 1e-3, size=shard_shape).astype(gen_dtype)
+                        return jnp.asarray(arr_np, dtype=weight_dtype)
+                    else:
+                        return jnp.zeros(shard_shape, dtype=weight_dtype)
+
+                expert_weight = jax.make_array_from_callback(
+                    expert_weight_shape, expert_sharding, make_expert_shard
+                )
+                collected_weights.append(expert_weight)
+
+            # Stack all expert weights: (num_experts, ...)
+            stacked_weight = jnp.stack(collected_weights, axis=0)
+
+            # Apply final sharding with expert axis if needed
+            if mapping.sharding and "expert" in mapping.sharding:
+                # Use MOE mesh with expert parallelism
+                ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
+                if ep_size > 1:
+                    world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+                    tp_size = world_size // ep_size
+
+                    devices = self.mesh.devices.flatten()
+                    moe_mesh = jax.sharding.Mesh(
+                        devices.reshape(ep_size, tp_size), axis_names=("expert", "tensor")
+                    )
+                    final_sharding_spec = P(*mapping.sharding)
+                    final_sharding = jax.sharding.NamedSharding(moe_mesh, final_sharding_spec)
+                else:
+                    # No expert parallelism, use regular mesh
+                    final_sharding_spec = P(*mapping.sharding)
+                    final_sharding = jax.sharding.NamedSharding(self.mesh, final_sharding_spec)
+            else:
+                final_sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
+                final_sharding = jax.sharding.NamedSharding(self.mesh, final_sharding_spec)
+
+            # Reshard to final sharding
+            sharded_weight = jax.device_put(stacked_weight, final_sharding)
+            model_param.value = sharded_weight.astype(dtype)
+
+            logger.debug(
+                "Generated dummy MOE weight for %s, shape=%s, num_experts=%s, sharding=%s",
+                target_path,
+                full_shape,
+                num_experts,
+                mapping.sharding,
+            )
 
         nnx.update(self.model, params)
         logger.info("Dummy weights generated successfully!")
 
-    # 其余方法（_iterate_weights, _handle_single_weight, _handle_split_weight等）保持不变
     def _iterate_weights(self):
-        # 保持原有实现...
         model_path = self.model_config.model_path
         weights_files = glob.glob(os.path.join(model_path, "*.safetensors"))
 
@@ -418,8 +462,8 @@ class WeightLoader:
                     safe_open(st_file, framework="flax") as f,
                 ):
                     needed_keys = []
-                    for name in f.keys():
-                        if not name.startswith("model.layers.") and not name.startswith("vision_model."):
+                    for name in f.keys():  # noqa: SIM118
+                        if not name.startswith("model.layers."):
                             needed_keys.append(name)
                             continue
 
@@ -452,11 +496,30 @@ class WeightLoader:
                 len(weights_files),
             )
 
-    def _handle_single_weight(self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping):
-        # 保持原有实现...
+    def _process_and_assign_weight(
+        self,
+        params: nnx.State,
+        hf_key: str,
+        hf_weight: jax.Array,
+        mapping: WeightMapping,
+    ):
+        processed_weight = hf_weight
+
+        if mapping.transpose and not hf_key.endswith(".bias"):
+            processed_weight = jnp.transpose(processed_weight, (1, 0))
+
+        if isinstance(mapping.target_path, list):
+            self._handle_split_weight(params, hf_key, processed_weight, mapping)
+        else:
+            self._handle_single_weight(params, hf_key, processed_weight, mapping)
+
+    def _handle_single_weight(
+        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+    ):
         jax_path = mapping.target_path
         processed_weight = weight
 
+        # Apply output_multiplier_scale to lm_head weights (matching PyTorch implementation)
         if "lm_head" in hf_key and hasattr(self.model_config.hf_config, "output_multiplier_scale"):
             logger.info(
                 "Applying output_multiplier_scale (%.2f) to %s",
@@ -490,12 +553,14 @@ class WeightLoader:
             logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
 
-    # 其他方法（_handle_split_weight, _split_qkv_weight, _shard_weight等）保持不变
-    def _handle_split_weight(self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping):
+    def _handle_split_weight(
+        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+    ):
         self._split_qkv_weight(params, hf_key, weight, mapping)
 
-    def _split_qkv_weight(self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping):
-        # 保持原有实现...
+    def _split_qkv_weight(
+        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+    ):
         jax_paths = mapping.target_path
 
         if hf_key.endswith(".bias"):
@@ -603,7 +668,9 @@ class WeightLoader:
             model_param.value = sharded_weight.astype(model_param.value.dtype)
             logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
-    def _shard_weight(self, weight: jax.Array, sharding_spec: tuple, mesh: jax.sharding.Mesh = None) -> jax.Array:
+    def _shard_weight(
+        self, weight: jax.Array, sharding_spec: tuple, mesh: jax.sharding.Mesh = None
+    ) -> jax.Array:
         if mesh is None:
             mesh = self.mesh
         target_sharding = jax.sharding.NamedSharding(mesh, P(*sharding_spec))
@@ -643,7 +710,9 @@ class WeightLoader:
 
         return current_level
 
-    def _apply_head_dim_padding(self, weight: jax.Array, hf_key: str, mapping: WeightMapping) -> jax.Array:
+    def _apply_head_dim_padding(
+        self, weight: jax.Array, hf_key: str, mapping: WeightMapping
+    ) -> jax.Array:
         if hf_key.endswith(".bias"):
             if any(proj in hf_key for proj in ["q_proj", "k_proj", "v_proj"]):
                 if "q_proj" in hf_key:
@@ -714,6 +783,7 @@ class WeightLoader:
         return weight
 
     def _apply_kv_head_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
+        """Apply KV head padding/replication when tp_size > total_kv_heads."""
         if any(
             proj in hf_key for proj in ["k_proj", "v_proj"]
         ) and self.model_config.needs_kv_head_replication(self.sharding_size):
@@ -758,26 +828,12 @@ class WeightLoader:
         return weight
 
     def _is_excluded_layer_weight(self, hf_key: str) -> bool:
-        # Handle model layers exclusion logic
-        if hf_key.startswith("model.layers."):
-            parts = hf_key.split(".")
-            if len(parts) >= 3 and parts[2].isdigit():
-                layer_num = int(parts[2])
-                return layer_num >= self.model_config.num_hidden_layers
+        if not hf_key.startswith("model.layers."):
             return False
 
-        # Handle visual components exclusion logic
-        if hf_key.startswith("visual."):
-            # Check for visual blocks with numeric indices
-            if hf_key.startswith("visual.blocks."):
-                parts = hf_key.split(".")
-                if len(parts) >= 3 and parts[2].isdigit():
-                    layer_num = int(parts[2])
-                    max_vision_layers = getattr(self.model_config, "num_vision_layers", 0)
-                    return layer_num >= max_vision_layers
-            
-            # Exclude other visual components not part of numbered blocks
-            # (matches visual.merger.*, visual.patch_embed.* etc.)
-            return True
+        parts = hf_key.split(".")
+        if len(parts) < 3 or not parts[2].isdigit():
+            return False
 
-        return False
+        layer_num = int(parts[2])
+        return layer_num >= self.model_config.num_hidden_layers
