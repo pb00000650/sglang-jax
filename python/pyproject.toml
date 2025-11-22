@@ -33,12 +33,14 @@ dependencies = [
     "typing-extensions~=4.14.1",
     "uvicorn~=0.35.0",
     "uvloop~=0.21.0",
+    "soundfile==0.13.1",
     "psutil",
     "httpx",
     "openai",
     "pandas",
     "aiohttp",
     "pybase64",
+    "decord",
     "partial_json_parser",
 ]
 

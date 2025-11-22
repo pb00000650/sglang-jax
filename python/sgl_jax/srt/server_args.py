@@ -8,7 +8,7 @@ import os
 import tempfile
 
 import jax
-
+from typing import Any, Dict, Optional
 from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
 from sgl_jax.srt.hf_transformers_utils import check_gguf_file, get_config
 from sgl_jax.srt.reasoning_parser import ReasoningParser
@@ -77,6 +77,7 @@ class ServerArgs:
     dist_timeout: int | None = None  # timeout for distributed initialization
     download_dir: str | None = None
     sleep_on_idle: bool = False
+    mm_process_config: Optional[Dict[str, Any]] = None
 
     # Data parallel
     dp_size: int = 1
@@ -118,6 +119,7 @@ class ServerArgs:
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
     enable_precision_tracer: bool = False
+    disable_fast_image_processor: bool = False
 
     # Kernel backend
     attention_backend: str | None = "fa"
@@ -166,6 +168,9 @@ class ServerArgs:
                 self.device = platform_env
             else:
                 self.device = "tpu"
+
+        if self.mm_process_config is None:
+            self.mm_process_config = {}
 
         if self.served_model_name is None:
             self.served_model_name = self.model_path
@@ -562,6 +567,13 @@ class ServerArgs:
             "--sleep-on-idle",
             action="store_true",
             help="Reduce CPU usage when sglang is idle.",
+        )
+
+        parser.add_argument(
+            "--mm-process-config",
+            type=json.loads,
+            default=ServerArgs.mm_process_config,
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
         )
 
         # Logging

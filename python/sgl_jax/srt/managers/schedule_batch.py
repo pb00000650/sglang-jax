@@ -21,10 +21,12 @@ import dataclasses
 import logging
 import threading
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union, Callable
+from enum import Enum, auto
 
 import jax
 import numpy as np
+
 from jax import numpy as jnp
 from jax._src import mesh as mesh_lib
 
@@ -40,6 +42,9 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
 )
+
+from sgl_jax.srt.utils import flatten_nested_list
+
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -144,7 +149,269 @@ class FINISH_ABORT(BaseFinishReason):
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
+        
+class Modality(Enum):
+    IMAGE = auto()
+    MULTI_IMAGES = auto()
+    VIDEO = auto()
+    AUDIO = auto()
 
+    @staticmethod
+    def from_str(modality_str: str):
+        try:
+            return Modality[modality_str.upper()]
+        except KeyError:
+            raise ValueError(
+                f"Invalid modality string: {modality_str}. Valid modalities are: {[m.name for m in Modality]}"
+            )
+
+    @staticmethod
+    def all():
+        return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
+
+
+@dataclasses.dataclass
+class MultimodalDataItem:
+    """
+    一个MultimodalDataItem包含一种模态的所有输入。
+    例如，如果有3个图像和1个音频输入，将有2个MultimodalDataItem：一个用于图像，一个用于音频。
+    
+    公共字段放在前面，模型特定字段放在model_specific_data中。
+    """
+
+    modality: Modality
+    hash: Optional[int] = None
+    pad_value: Optional[int] = None
+    offsets: Optional[List] = None
+
+    # 处理器返回的原始特征，例如pixel_values或audio_features
+    feature: Optional[Union[jax.Array, np.ndarray]] = None
+    # 预计算的嵌入，作为最终编码器嵌入传递
+    # feature和precomputed_embeddings中只有一个不为空
+    precomputed_embeddings: Optional[Union[jax.Array, np.ndarray]] = None
+
+    # 存储在字典中的模型特定数据
+    model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def __getattr__(self, name: str):
+        if (
+            "model_specific_data" in self.__dict__
+            and name in self.__dict__["model_specific_data"]
+        ):
+            return self.__dict__["model_specific_data"][name]
+        else:
+            raise AttributeError(
+                f"'{self.__class__.__name__}' object has no attribute '{name}'"
+            )
+
+    def __setitem__(self, key: str, value: Any):
+        if key in self.__dict__:
+            self.__dict__[key] = value
+        else:
+            self.model_specific_data[key] = value
+
+    def set(self, key: str, value: Any):
+        self.__setitem__(key, value)
+
+    @staticmethod
+    def is_empty_list(l):
+        if l is None:
+            return True
+        return len([item for item in flatten_nested_list(l) if item is not None]) == 0
+
+    def set_pad_value(self):
+        """
+        首先对数据进行哈希后设置填充值
+        """
+        from sgl_jax.srt.managers.mm_utils import hash_feature
+
+        if self.hash is None:
+            if self.feature is not None:
+                hashed_feature = self.feature
+            else:
+                hashed_feature = self.precomputed_embeddings
+            self.hash = hash_feature(hashed_feature)
+        assert self.hash is not None
+        self.pad_value = self.hash % (1 << 30)
+
+    def is_modality(self, modality: Modality) -> bool:
+        return self.modality == modality
+
+    def is_audio(self):
+        return self.modality == Modality.AUDIO
+
+    def is_image(self):
+        return self.modality in [Modality.IMAGE, Modality.MULTI_IMAGES]
+
+    def is_video(self):
+        return self.modality == Modality.VIDEO
+
+    def is_valid(self) -> bool:
+        return self.is_image() or self.is_video() or self.is_audio()
+
+    def validate(self):
+        # TODO: 实现验证逻辑
+        pass
+
+    @staticmethod
+    def from_dict(obj: dict):
+        kwargs = dict(obj)
+        modality = kwargs.pop("modality")
+        if isinstance(modality, str):
+            modality = Modality[modality]
+        ret = MultimodalDataItem(modality=modality, **kwargs)
+        ret.validate()
+        return ret
+
+    def merge(self, other):
+        # 合并特征（处理JAX数组和NumPy数组）
+        if self.feature is not None and other.feature is not None:
+            if isinstance(self.feature, jax.Array) and isinstance(other.feature, jax.Array):
+                self.feature = jnp.concatenate([self.feature, other.feature], axis=0)
+            elif isinstance(self.feature, np.ndarray) and isinstance(other.feature, np.ndarray):
+                self.feature = np.concatenate([self.feature, other.feature], axis=0)
+            else:
+                # 混合类型时转换为JAX数组
+                self.feature = jnp.concatenate(
+                    [jax.device_put(self.feature), jax.device_put(other.feature)], 
+                    axis=0
+                )
+        
+        # 合并偏移量
+        if self.offsets is not None and other.offsets is not None:
+            self.offsets += other.offsets
+        
+        # 更新哈希
+        self.hash = hash((self.hash, other.hash))
+        self.set_pad_value()
+
+
+@dataclasses.dataclass
+class MultimodalInputs:
+    """与多模态数据相关的输入"""
+
+    # 数据项列表
+    mm_items: List[MultimodalDataItem]
+    image_pad_len: Optional[List] = None
+    num_image_tokens: Optional[int] = None
+
+    # 图像相关
+    im_token_id: Optional[int] = None
+    im_start_id: Optional[int] = None
+    im_end_id: Optional[int] = None
+    slice_start_id: Optional[int] = None
+    slice_end_id: Optional[int] = None
+
+    # 视频相关
+    video_token_id: Optional[int] = None
+
+    # 音频相关
+    audio_token_id: Optional[int] = None
+    audio_start_id: Optional[int] = None
+    audio_end_id: Optional[int] = None
+
+    # QWen2-VL相关
+    mrope_positions: Optional[jax.Array] = None
+    mrope_position_delta: Optional[jax.Array] = None
+
+    @staticmethod
+    def from_dict(obj: dict):
+        mm_items = []
+        for item_data in obj.get("mm_items", []):
+            if isinstance(item_data, dict):
+                mm_items.append(MultimodalDataItem.from_dict(item_data))
+            elif isinstance(item_data, MultimodalDataItem):
+                mm_items.append(item_data)
+        
+        ret = MultimodalInputs(
+            mm_items=mm_items,
+        )
+
+        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
+        for item in ret.mm_items:
+            item.set_pad_value()
+
+        optional_args = [
+            "mrope_positions",
+            "mrope_position_delta",
+            "im_token_id",
+            "im_start_id",
+            "im_end_id",
+            "video_token_id",
+            "slice_start_id",
+            "slice_end_id",
+            "audio_start_id",
+            "audio_end_id",
+            "audio_token_id",
+            "image_pad_len",
+            "num_image_tokens",
+        ]
+        for arg in optional_args:
+            if arg in obj:
+                value = obj[arg]
+                if isinstance(value, (np.ndarray, jax.Array)):
+                    setattr(ret, arg, jax.device_put(value))
+                else:
+                    setattr(ret, arg, value)
+
+        return ret
+
+    def contains_image_inputs(self) -> bool:
+        return any(item.is_image() for item in self.mm_items)
+
+    def contains_video_inputs(self) -> bool:
+        return any(item.is_video() for item in self.mm_items)
+
+    def contains_audio_inputs(self) -> bool:
+        return any(item.is_audio() for item in self.mm_items)
+
+    def contains_mm_input(self) -> bool:
+        return any(True for item in self.mm_items if item.is_valid())
+
+    def merge(self, other: "MultimodalInputs"):
+        """
+        合并请求时合并多模态输入
+        """
+        # 需要合并的参数
+        if self.image_pad_len is not None and other.image_pad_len is not None:
+            self.image_pad_len += other.image_pad_len
+
+        # 合并mm_items
+        self.mm_items += other.mm_items
+
+        # 合并mrope_positions（JAX数组处理）
+        if self.mrope_positions is not None:
+            if other.mrope_positions is not None:
+                self.mrope_positions = jnp.concatenate(
+                    [self.mrope_positions, other.mrope_positions], 
+                    axis=1
+                )
+        else:
+            self.mrope_positions = other.mrope_positions
+
+        # 合并mrope_position_delta（JAX数组处理）
+        if self.mrope_position_delta is not None:
+            if other.mrope_position_delta is not None:
+                self.mrope_position_delta = jnp.concatenate(
+                    [self.mrope_position_delta, other.mrope_position_delta], 
+                    axis=0
+                )
+        else:
+            self.mrope_position_delta = other.mrope_position_delta
+
+        # 合并token id相关参数（保留非None值）
+        for key in dir(self):
+            if "_id" in key and not key.startswith("__"):
+                self_val = getattr(self, key, None)
+                other_val = getattr(other, key, None)
+                if self_val is None and other_val is not None:
+                    setattr(self, key, other_val)
+
+        # 合并其他数值参数
+        if self.num_image_tokens is not None and other.num_image_tokens is not None:
+            self.num_image_tokens += other.num_image_tokens
+        elif self.num_image_tokens is None:
+            self.num_image_tokens = other.num_image_tokens
 
 class Req:
     """The input and output status of a request."""
