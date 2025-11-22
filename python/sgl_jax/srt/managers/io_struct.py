@@ -4,18 +4,9 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
-import jax
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
 
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
-from sgl_jax.srt.utils import ImageData
-
-# Handle serialization of Image for pydantic
-if TYPE_CHECKING:
-    from PIL.Image import Image
-else:
-    Image = Any
 
 @dataclass
 class BatchStrOut:
@@ -105,8 +96,6 @@ class TokenizedGenerateReqInput:
     text: list[str] | str | None = None
     # The token ids for text; one can specify either text or input_ids
     input_ids: list[list[int]] | list[int] | None = None
-    # The multimodal inputs
-    mm_inputs: list[dict] | dict | None = None
     # The sampling_params. See descriptions below.
     sampling_params: list[dict] | dict | None = None
     # Whether to return logprobs.
@@ -120,13 +109,6 @@ class TokenizedGenerateReqInput:
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to stream output
     stream: bool = False
-
-    image_paths: list[str] | None = None  # 图像文件路径列表
-    image_data: list[bytes] | None = None  # 原始图像字节数据（可选，优先级高于image_paths）
-    multimodal_tokens: list[int] | None = None  # 预编码的多模态特殊token（如<image>）
-    
-    image_embeddings: jax.Array | None = None  # 图像编码后的嵌入向量
-    image_token_count: int = 0  # 图像对应的token数量（用于位置编码计算）
 
 
 @dataclass
@@ -148,22 +130,6 @@ class EmbeddingReqInput:
     normalize: bool = True
 
 
-# Type definitions for multimodal input data
-# Individual data item types for each modality
-ImageDataInputItem = Union[Image, str, ImageData, Dict]
-AudioDataInputItem = Union[str, Dict]
-VideoDataInputItem = Union[str, Dict]
-# Union type for any multimodal data item
-MultimodalDataInputItem = Union[
-    ImageDataInputItem, VideoDataInputItem, AudioDataInputItem
-]
-# Format types supporting single items, lists, or nested lists for batch processing
-MultimodalDataInputFormat = Union[
-    List[List[MultimodalDataInputItem]],
-    List[MultimodalDataInputItem],
-    MultimodalDataInputItem,
-]
-
 @dataclass
 class GenerateReqInput:
     """Request input for text generation."""
@@ -174,19 +140,6 @@ class GenerateReqInput:
     input_ids: list[int] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: list[list[list[float]]] | list[list[float]] | None = None
-    
-    # The image input. It can be an image instance, file name, URL, or base64 encoded string.
-    # Can be formatted as:
-    # - Single image for a single request
-    # - List of images (one per request in a batch)
-    # - List of lists of images (multiple images per request)
-    # See also python/sglang/srt/utils.py:load_image for more details.
-    image_data: Optional[MultimodalDataInputFormat] = None
-    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
-    video_data: Optional[MultimodalDataInputFormat] = None
-    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
-    audio_data: Optional[MultimodalDataInputFormat] = None
-    
     sampling_params: Any | None = (
         None  # Using Any for now to avoid SamplingParams serialization issues
     )
@@ -201,13 +154,6 @@ class GenerateReqInput:
     token_ids_logprob: list[list[int]] | list[int] | None = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = True
-
-    def contains_mm_input(self) -> bool:
-        return (
-            has_valid_data(self.image_data)
-            or has_valid_data(self.video_data)
-            or has_valid_data(self.audio_data)
-        )
 
     def _normalize_rid(self, num):
         """Normalize request IDs for batch processing."""
@@ -317,15 +263,11 @@ class GenerateReqInput:
     def _normalize_sampling_params(self, num):
         """Normalize sampling parameters for batch processing."""
         if self.sampling_params is None:
-            self.sampling_params = [{} for _ in range(num)]  # 修复：使用列表推导式避免引用问题
+            self.sampling_params = [{}] * num
         elif isinstance(self.sampling_params, dict):
-            self.sampling_params = [copy.deepcopy(self.sampling_params) for _ in range(num)]  # 修复：深拷贝避免引用问题
+            self.sampling_params = [self.sampling_params] * num
         else:  # Already a list
-            # 修复：正确处理列表的扩展逻辑
-            expanded = []
-            for param in self.sampling_params:
-                expanded.extend([copy.deepcopy(param)] * self.parallel_sample_num)
-            self.sampling_params = expanded
+            self.sampling_params = self.sampling_params * self.parallel_sample_num
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""

@@ -19,27 +19,6 @@ from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
     assert k.shape == v.shape, f"k and v must have same shape, got {k.shape} vs {v.shape}"
 
-    # 处理4维输入（如包含batch和seq_len维度）
-    if k.ndim == 4:
-        num_tokens, seq_len, num_kv_heads, head_dim = k.shape
-        # 计算新形状并显式指定分片（保持最后两个维度的分片不变）
-        new_shape = (num_tokens * seq_len, num_kv_heads, head_dim)
-        # 获取原始分片信息
-        original_sharding = jax.sharding.get_sharding(k)
-        # 定义新分片：合并前两个维度，保持后两个维度的分片
-        new_sharding = jax.sharding.NamedSharding(
-            original_sharding.mesh,
-            jax.sharding.PartitionSpec(None, original_sharding.spec[2], original_sharding.spec[3])
-        )
-        # 显式指定分片进行reshape
-        k = jax.lax.reshape(k, new_shape, sharding=new_sharding)
-        v = jax.lax.reshape(v, new_shape, sharding=new_sharding)
-    elif k.ndim != 3:
-        raise ValueError(
-            f"Expected key tensor to be 3D or 4D, got {k.ndim}D. "
-            "Check if attention inputs are properly formatted."
-        )
-
     num_tokens, num_kv_heads, head_dim = k.shape
 
     kv_stacked = jnp.stack([k, v], axis=2)  # [tokens, heads, 2, head_dim]

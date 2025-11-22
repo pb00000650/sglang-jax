@@ -266,9 +266,6 @@ class Req:
         self.temp_input_token_ids_logprobs_val: list[float] | None = None
         self.temp_input_token_ids_logprobs_idx: list[int] | None = None
 
-        self.image_embeddings: jax.Array | None = None
-        self.image_token_count: int = 0  # 用于计算位置偏移
-        
         if return_logprob:
             # shape: (bs, 1)
             self.output_token_logprobs_val = []

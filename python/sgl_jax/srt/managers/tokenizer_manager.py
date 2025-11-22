@@ -276,34 +276,13 @@ class TokenizerManager:
         # Tokenize
         input_text = obj.text
         input_ids = obj.input_ids
-        image_data = getattr(obj, "image_data", None)  # 从请求中获取图像数据
-        image_paths = getattr(obj, "image_paths", None)
-
         if input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(
                     "Tokenizer is not initialized but input_text requires tokenization"
                 )
-            # 多模态特殊处理：插入图像标记
-            if self.model_config.is_multimodal and (image_data or image_paths):
-                # 1. 编码图像（假设encode_images已定义）
-                image_embeddings = await asyncio.to_thread(
-                    encode_images,  # 同步函数异步化
-                    paths=image_paths,
-                    data=image_data,
-                    processor=self.mm_processor,
-                    model_config=self.model_config
-                )
-                
-                # 2. 在文本中插入图像标记（如 <image>）
-                if self.image_token_id is not None:
-                    input_text = f"<image>\n{input_text}"  # 前置图像标记
-                encoded = self.tokenizer(input_text)
-                input_ids = encoded["input_ids"]
-            else:
-                encoded = self.tokenizer(input_text)
-                input_ids = encoded["input_ids"]
-
+            encoded = self.tokenizer(input_text)
+            input_ids = encoded["input_ids"]
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(obj, input_text, input_ids)
 
@@ -313,11 +292,6 @@ class TokenizerManager:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
 
         input_token_num = len(input_ids) if input_ids is not None else 0
-        
-        # 新增：添加图像标记占用的 token 数
-        image_token_num = getattr(obj, "image_token_num", 0)
-        total_input_tokens = input_token_num + image_token_num
-
         # Check if input alone exceeds context length
         if input_token_num >= self.context_len:
             raise ValueError(
@@ -326,7 +300,7 @@ class TokenizerManager:
             )
 
         # Check total tokens (input + max_new_tokens)
-        max_new_tokens = obj.sampling_params.get("max_new_tokens") if isinstance(obj, GenerateReqInput) else None
+        max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if max_new_tokens is not None and (max_new_tokens + input_token_num) >= self.context_len:
             total_tokens = max_new_tokens + input_token_num
             error_msg = (
@@ -344,74 +318,62 @@ class TokenizerManager:
                 f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
             )
 
-    def _create_tokenized_object(self, obj, input_text, input_ids, image_embeddings=None, image_token_num=None):
-        """Create appropriate tokenized object based on input type"""
-        if isinstance(obj, GenerateReqInput):
-            return TokenizedGenerateReqInput(
-                rid=obj.rid,
-                input_ids=input_ids,
-                text=input_text,
-                sampling_params=obj.sampling_params,
-                return_logprob=obj.return_logprob,
-                logprob_start_len=obj.logprob_start_len,
-                top_logprobs_num=obj.top_logprobs_num,
-                token_ids_logprob=obj.token_ids_logprob,
-                stream=obj.stream,
-                image_embeddings=image_embeddings,
-                image_token_num=image_token_num,
-                return_text_in_logprobs=obj.return_text_in_logprobs,
-            )
-        elif isinstance(obj, EmbeddingReqInput):
-            return TokenizedEmbeddingReqInput(
-                rid=obj.rid,
-                input_ids=input_ids,
-                input_text=input_text,
-                image_embeddings=image_embeddings,
-                image_token_num=image_token_num,
-            )
+    def _create_tokenized_object(
+        self,
+        obj: GenerateReqInput,
+        input_text: str,
+        input_ids: list[int],
+    ) -> TokenizedGenerateReqInput:
+        """Create a tokenized request object from common parameters."""
+        # Parse sampling parameters
+        # Note: if there are preferred sampling params, we use them if they are not
+        # explicitly passed in sampling_params
+        if self.preferred_sampling_params:
+            sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
-            raise ValueError(f"Unsupported request type: {type(obj)}")
+            sampling_kwargs = obj.sampling_params
+        sampling_params = SamplingParams(**sampling_kwargs)
+        sampling_params.normalize(self.tokenizer)
+        sampling_params.verify(self.model_config.vocab_size)
+
+        # Build return object
+
+        tokenized_obj = TokenizedGenerateReqInput(
+            obj.rid,
+            input_text,
+            input_ids,
+            sampling_params,
+            obj.return_logprob,
+            obj.logprob_start_len,
+            obj.top_logprobs_num,
+            obj.token_ids_logprob,
+            obj.stream,
+        )
+
+        return tokenized_obj
+
     async def _batch_tokenize_and_process(
         self, batch_size: int, obj: GenerateReqInput
     ) -> list[TokenizedGenerateReqInput | TokenizedEmbeddingReqInput]:
-        """Handle batch tokenization (支持多模态批量请求)"""
-        logger.debug("Starting batch tokenization for %s requests", batch_size)
+        """Handle batch tokenization for text inputs only."""
+        logger.debug("Starting batch tokenization for %s text requests", batch_size)
 
+        # Collect requests and texts
         requests = [obj[i] for i in range(batch_size)]
-        texts = []
-        image_data_list = []
-        image_paths_list = []
+        texts = [req.text for req in requests]
 
-        # 分离文本和图像输入
-        for req in requests:
-            texts.append(req.text)
-            image_data_list.append(getattr(req, "image_data", None))
-            image_paths_list.append(getattr(req, "image_paths", None))
-
-        # 批量编码文本
-        encoded = self.tokenizer(texts, padding=True, truncation=True)
+        # Batch tokenize all texts
+        encoded = self.tokenizer(texts)
         input_ids_list = encoded["input_ids"]
 
-        # 批量编码图像（如果有）
-        image_embeddings_list = None
-        if self.model_config.is_multimodal and any(image_data_list + image_paths_list):
-            image_embeddings_list = await asyncio.to_thread(
-                encode_images,
-                paths=image_paths_list,
-                data=image_data_list,
-                processor=self.mm_processor,
-                model_config=self.model_config
-            )
-
-        # 构建 tokenized 对象列表
+        # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
-            image_embeddings = image_embeddings_list[i] if image_embeddings_list else None
+            # self._validate_token_len(obj[i], input_ids_list[i])
             tokenized_objs.append(
-                self._create_tokenized_object(
-                    req, req.text, input_ids_list[i], image_embeddings
-                )
+                self._create_tokenized_object(req, req.text, input_ids_list[i], None, None)
             )
+        logger.debug("Completed batch processing for %s requests", batch_size)
         return tokenized_objs
 
     def _validate_batch_tokenization_constraints(
@@ -717,7 +679,6 @@ class TokenizerManager:
                         "input_ids",
                         "input_embeds",
                         "image_data",
-                        "image_paths",
                         "audio_data",
                         "lora_path",
                         "sampling_params",
@@ -1322,26 +1283,3 @@ class _Communicator[T]:
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
-
-
-# 假设的图像编码函数（需要根据实际实现补充）
-def encode_images(paths=None, data=None, processor=None, model_config=None):
-    """编码图像数据为嵌入向量"""
-    # 实际实现应根据模型配置和处理器进行图像编码
-    # 这里仅作为占位符
-    image_embeddings = []
-    if paths:
-        for path in paths:
-            if path is not None:
-                # 处理图像路径
-                image_embeddings.append(None)  # 实际应返回编码后的嵌入
-            else:
-                image_embeddings.append(None)
-    elif data:
-        for img_data in data:
-            if img_data is not None:
-                # 处理图像数据
-                image_embeddings.append(None)  # 实际应返回编码后的嵌入
-            else:
-                image_embeddings.append(None)
-    return image_embeddings if len(image_embeddings) > 1 else image_embeddings[0]

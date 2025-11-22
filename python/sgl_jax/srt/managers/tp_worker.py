@@ -1,10 +1,9 @@
-"""A tensor parallel worker with multimodal support."""
+"""A tensor parallel worker."""
 
 import itertools
 import logging
 import threading
 import time
-from typing import Optional, Tuple, List, Dict, Any
 
 import jax
 import jax.numpy as jnp
@@ -12,9 +11,6 @@ import numpy as np
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
 from tqdm import tqdm
-from PIL import Image
-import base64
-import io
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
@@ -42,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 class ModelWorker:
-    """A tensor parallel model worker with multimodal support."""
+    """A tensor parallel model worker."""
 
     def __init__(
         self,
@@ -186,25 +182,6 @@ class ModelWorker:
             for item in self.precompile_bs_paddings
         ]
 
-        # Initialize multimodal processor if available
-        self.mm_processor = self._init_mm_processor()
-
-    def _init_mm_processor(self) -> Optional[Any]:
-        """Initialize multimodal processor for handling images"""
-        if not self.model_config.is_multimodal:
-            return None
-            
-        try:
-            from transformers import AutoProcessor
-            return AutoProcessor.from_pretrained(
-                self.model_config.model_path,
-                trust_remote_code=self.server_args.trust_remote_code,
-                revision=self.model_config.model_revision
-            )
-        except Exception as e:
-            logger.warning(f"Failed to initialize multimodal processor: {e}")
-            return None
-
     def normalize_token_paddings(self):
         normalized_token_paddings = []
 
@@ -312,17 +289,25 @@ class ModelWorker:
         logger.info("[DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
-        # 修正：使用self而非self.worker访问model_runner
         self.model_runner.attn_backend.forward_metadata = (
-            self.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
+            self.worker.model_runner.attn_backend.get_forward_metadata(model_worker_batch)
         )
 
     def get_max_padded_size(self):
-        """Calculate the max padded batch size and token nums."""
+        """Calculate the max padded batch size and token nums.
+
+        Returns:
+            tuple: (max_padded_batch_size, max_padded_num_tokens)
+                - max_padded_batch_size: Maximum batch size, constrained by max_running_requests
+                - max_padded_num_tokens: Maximum tokens, using chunked_prefill_size if enabled
+        """
+        # Use chunked prefill size if enabled (> 0), otherwise use max prefill tokens
+        # Take minimum with max_prefill_tokens as upper bound
         max_padded_num_tokens = self.max_prefill_tokens
         if self.chunked_prefill_size > 0 and max_padded_num_tokens > self.chunked_prefill_size:
             max_padded_num_tokens = self.chunked_prefill_size
 
+        # Batch size is constrained by both max_running_requests and available tokens divide by page_size
         max_padded_batch_size = min(self.max_running_requests, max_padded_num_tokens)
 
         return max_padded_batch_size, max_padded_num_tokens
@@ -334,48 +319,6 @@ class ModelWorker:
             self.precompile_cache_loc_paddings,
         )
 
-    def _process_images(self, images: List[str]) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """
-        Process base64 encoded images into model-ready tensors
-        
-        Args:
-            images: List of base64 encoded images
-            
-        Returns:
-            image_tensors: Processed image tensors
-            image_masks: Masks indicating valid images
-        """
-        if not self.mm_processor or not images:
-            return None, None
-            
-        processed_images = []
-        image_masks = []
-        
-        for img_str in images:
-            if img_str:
-                try:
-                    # Decode base64 to image
-                    img_data = base64.b64decode(img_str)
-                    img = Image.open(io.BytesIO(img_data)).convert("RGB")
-                    
-                    # Process image using multimodal processor
-                    processed = self.mm_processor(images=img, return_tensors="jax")
-                    processed_images.append(processed.pixel_values[0])
-                    image_masks.append(1)
-                except Exception as e:
-                    logger.warning(f"Error processing image: {e}")
-                    processed_images.append(jnp.zeros((3, 224, 224)))  # Dummy image
-                    image_masks.append(0)
-            else:
-                processed_images.append(jnp.zeros((3, 224, 224)))  # Dummy image
-                image_masks.append(0)
-                
-        # Stack into batches and move to device
-        image_tensors = jnp.stack(processed_images)
-        image_masks = jnp.array(image_masks, dtype=jnp.int32)
-        
-        return image_tensors, image_masks
-
     def generate_model_worker_batch(
         self,
         bs: int,
@@ -384,7 +327,6 @@ class ModelWorker:
         max_cache_loc_size: int,
         do_penalties: bool = False,
         speculative_algotithm=None,
-        images: Optional[List[str]] = None,
     ) -> ModelWorkerBatch:
         valid_input_ids = np.array([1] * bs, dtype=jnp.int32)
         invalid_input_ids = np.array([0] * (num_tokens - bs), dtype=jnp.int32)
@@ -399,15 +341,7 @@ class ModelWorker:
         valid_cache_loc = np.arange(bs)
         invalid_cache_loc = np.array([0] * (invalid_cache_loc_size), dtype=jnp.int32)
 
-        # Process images if provided and model is multimodal
-        image_tensors, image_masks = None, None
-        if self.model_config.is_multimodal and images:
-            # Pad images list to match batch size
-            padded_images = images[:bs] + [None] * max(0, bs - len(images))
-            image_tensors, image_masks = self._process_images(padded_images)
-
-        # 创建ModelWorkerBatch时添加图像相关属性
-        batch = ModelWorkerBatch(
+        return ModelWorkerBatch(
             bid=1,
             forward_mode=mode,
             input_ids=np.concat([valid_input_ids, invalid_input_ids], axis=0),
@@ -436,12 +370,6 @@ class ModelWorker:
             capture_hidden_mode=CaptureHiddenMode.NULL,
             spec_algorithm=speculative_algotithm,
         )
-
-        # 为batch添加图像相关属性（如果ModelWorkerBatch不原生支持，可能需要修改其定义）
-        batch.image_tensors = image_tensors
-        batch.image_masks = image_masks
-        
-        return batch
 
     def get_model_runner(self):
         return self.model_runner
@@ -510,18 +438,14 @@ class ModelWorker:
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
     ) -> tuple[LogitsProcessorOutput | jax.Array | int, jax.Array | None]:
-        # 初始化new_logits_output避免未定义引用
-        new_logits_output = None
-        
-        # Use pre-initialized ForwardBatch if available
+        # Use pre-initialized ForwardBatch if available (for overlap scheduling optimization)
         if model_worker_batch.forward_batch is not None:
             forward_batch = model_worker_batch.forward_batch
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         if forward_metadata is None:
-            # 修正：使用self而非self.worker访问model_runner
-            forward_metadata = self.model_runner.attn_backend.get_forward_metadata(
+            forward_metadata = self.worker.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
             )
 
@@ -533,12 +457,6 @@ class ModelWorker:
                 self.model_config.vocab_size,
             )
 
-        # Add image tensors to forward metadata for multimodal models
-        if self.model_config.is_multimodal and hasattr(model_worker_batch, 'image_tensors') and model_worker_batch.image_tensors is not None:
-            forward_metadata["image_tensors"] = model_worker_batch.image_tensors
-            forward_metadata["image_masks"] = model_worker_batch.image_masks
-
-        # 修正：使用self而非self.worker访问model_runner
         self.model_runner.attn_backend.forward_metadata = forward_metadata
         logits_output, cache_miss_count = self.model_runner.forward(
             forward_batch,
@@ -547,8 +465,9 @@ class ModelWorker:
         if launch_done is not None:
             launch_done.set()
 
-        next_token_ids_device = None
-        if not skip_sample:
+        if skip_sample:
+            next_token_ids_device = None
+        else:
             import jax._src.test_util as jtu
 
             # Preprocess logits: update grammar vocab masks if needed
@@ -598,7 +517,7 @@ class ModelWorker:
 
 
 class MockModelWorker:
-    """A mock tensor parallel model worker with multimodal support."""
+    """A mock tensor parallel model worker."""
 
     def __init__(
         self,
@@ -624,9 +543,6 @@ class MockModelWorker:
             server_args=server_args,
         )
 
-        # Initialize multimodal processor if available
-        self.mm_processor = self._init_mm_processor()
-
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
@@ -648,21 +564,6 @@ class MockModelWorker:
 
         # A reference make this class has the same member as TpModelWorkerClient
         self.worker = self
-
-    def _init_mm_processor(self) -> Optional[Any]:
-        """Initialize multimodal processor for handling images"""
-        if not self.model_config.is_multimodal:
-            return None
-            
-        try:
-            from transformers import AutoProcessor
-            return AutoProcessor.from_pretrained(
-                self.model_config.model_path,
-                trust_remote_code=self.server_args.trust_remote_code,
-                revision=self.model_config.model_revision
-            )
-        except Exception:
-            return None
 
     def get_worker_info(self):
         return (
@@ -693,5 +594,4 @@ class MockModelWorker:
                 next_token_logits=jnp.array([0, 1]),
             ),
             None,
-            0,  # 补充缺失的cache_miss_count返回值
         )
