@@ -13,6 +13,7 @@ import logging
 import io
 from io import BytesIO
 import os
+import pybase64
 import random
 import re
 import resource
@@ -21,6 +22,7 @@ import signal
 import subprocess
 import tempfile
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -28,6 +30,7 @@ import pybase64
 from urllib.parse import urlparse
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional, Literal, Union, Tuple, bytes
 from functools import lru_cache
@@ -36,6 +39,11 @@ import numpy as np
 import psutil
 import zmq
 from fastapi.responses import ORJSONResponse
+from PIL import Image
+from dataclasses import dataclass
+import requests
+import jax
+import jax.numpy as jnp
 
 from PIL import Image
 from dataclasses import dataclass
@@ -406,6 +414,18 @@ def flatten_nested_list(nested_list):
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
     logger.warning(msg, stacklevel=2)
+
+def flatten_nested_list(nested_list):
+    if isinstance(nested_list, list):
+        return [item for sublist in nested_list for item in flatten_nested_list(sublist)]
+    else:
+        return [nested_list]
+
+
+def print_warning_once(msg: str) -> None:
+    # Set the stacklevel to 2 to print the caller's line info
+    logger.warning(msg, stacklevel=2)
+
 
 def lru_cache_frozenset(maxsize=128):
     def _to_hashable(o):

@@ -828,12 +828,25 @@ class WeightLoader:
         return weight
 
     def _is_excluded_layer_weight(self, hf_key: str) -> bool:
-        if not hf_key.startswith("model.layers."):
-            return False
+        # Handle model layers exclusion logic
+        if hf_key.startswith("model.layers."):
+            parts = hf_key.split(".")
+            if len(parts) >= 3 and parts[2].isdigit():
+                layer_num = int(parts[2])
+                return layer_num >= self.model_config.num_hidden_layers
 
-        parts = hf_key.split(".")
-        if len(parts) < 3 or not parts[2].isdigit():
-            return False
+            # Handle visual components exclusion logic
+        if hf_key.startswith("visual."):
+            # Check for visual blocks with numeric indices
+            if hf_key.startswith("visual.blocks."):
+                parts = hf_key.split(".")
+                if len(parts) >= 3 and parts[2].isdigit():
+                    layer_num = int(parts[2])
+                    max_vision_layers = getattr(self.model_config, "num_vision_layers", 0)
+                    return layer_num >= max_vision_layers
 
-        layer_num = int(parts[2])
-        return layer_num >= self.model_config.num_hidden_layers
+            # Exclude other visual components not part of numbered blocks
+            # (matches visual.merger.*, visual.patch_embed.* etc.)
+            return True
+
+        return False

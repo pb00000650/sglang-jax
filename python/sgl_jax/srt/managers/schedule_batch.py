@@ -149,7 +149,8 @@ class FINISH_ABORT(BaseFinishReason):
             "status_code": self.status_code,
             "err_type": self.err_type,
         }
-        
+
+
 class Modality(Enum):
     IMAGE = auto()
     MULTI_IMAGES = auto()
@@ -175,7 +176,7 @@ class MultimodalDataItem:
     """
     一个MultimodalDataItem包含一种模态的所有输入。
     例如，如果有3个图像和1个音频输入，将有2个MultimodalDataItem：一个用于图像，一个用于音频。
-    
+
     公共字段放在前面，模型特定字段放在model_specific_data中。
     """
 
@@ -194,15 +195,10 @@ class MultimodalDataItem:
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def __getattr__(self, name: str):
-        if (
-            "model_specific_data" in self.__dict__
-            and name in self.__dict__["model_specific_data"]
-        ):
+        if "model_specific_data" in self.__dict__ and name in self.__dict__["model_specific_data"]:
             return self.__dict__["model_specific_data"][name]
         else:
-            raise AttributeError(
-                f"'{self.__class__.__name__}' object has no attribute '{name}'"
-            )
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
     def __setitem__(self, key: str, value: Any):
         if key in self.__dict__:
@@ -273,14 +269,13 @@ class MultimodalDataItem:
             else:
                 # 混合类型时转换为JAX数组
                 self.feature = jnp.concatenate(
-                    [jax.device_put(self.feature), jax.device_put(other.feature)], 
-                    axis=0
+                    [jax.device_put(self.feature), jax.device_put(other.feature)], axis=0
                 )
-        
+
         # 合并偏移量
         if self.offsets is not None and other.offsets is not None:
             self.offsets += other.offsets
-        
+
         # 更新哈希
         self.hash = hash((self.hash, other.hash))
         self.set_pad_value()
@@ -322,7 +317,7 @@ class MultimodalInputs:
                 mm_items.append(MultimodalDataItem.from_dict(item_data))
             elif isinstance(item_data, MultimodalDataItem):
                 mm_items.append(item_data)
-        
+
         ret = MultimodalInputs(
             mm_items=mm_items,
         )
@@ -383,8 +378,7 @@ class MultimodalInputs:
         if self.mrope_positions is not None:
             if other.mrope_positions is not None:
                 self.mrope_positions = jnp.concatenate(
-                    [self.mrope_positions, other.mrope_positions], 
-                    axis=1
+                    [self.mrope_positions, other.mrope_positions], axis=1
                 )
         else:
             self.mrope_positions = other.mrope_positions
@@ -393,8 +387,7 @@ class MultimodalInputs:
         if self.mrope_position_delta is not None:
             if other.mrope_position_delta is not None:
                 self.mrope_position_delta = jnp.concatenate(
-                    [self.mrope_position_delta, other.mrope_position_delta], 
-                    axis=0
+                    [self.mrope_position_delta, other.mrope_position_delta], axis=0
                 )
         else:
             self.mrope_position_delta = other.mrope_position_delta
@@ -412,6 +405,7 @@ class MultimodalInputs:
             self.num_image_tokens += other.num_image_tokens
         elif self.num_image_tokens is None:
             self.num_image_tokens = other.num_image_tokens
+
 
 class Req:
     """The input and output status of a request."""

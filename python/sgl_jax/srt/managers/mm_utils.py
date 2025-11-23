@@ -42,8 +42,8 @@ def tensor_hash(tensor_list: Any) -> int:
     if isinstance(tensor, jnp.ndarray):
         if tensor.device().platform == "gpu":
             return gpu_tensor_hash(tensor)
-            
+
         tensor_cpu = jax.device_get(tensor).astype(jnp.float32)
         return data_hash(tensor_cpu.tobytes())
-    
+
     raise TypeError(f"Unsupported tensor type: {type(tensor)}")

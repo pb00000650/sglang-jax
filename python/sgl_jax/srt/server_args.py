@@ -35,6 +35,7 @@ class ServerArgs:
     trust_remote_code: bool = False
     context_length: int | None = None
     is_embedding: bool = False
+    enable_multimodal: Optional[bool] = None
     revision: str | None = None
     model_impl: str = "auto"
     model_layer_nums: int | None = None
@@ -216,6 +217,9 @@ class ServerArgs:
         # Normalize speculative_algorithm: treat empty string as None
         if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
+
+        if self.disable_fast_image_processor:
+            logger.info("Fast image processor is disabled")
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
@@ -464,6 +468,17 @@ class ServerArgs:
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        )
+        parser.add_argument(
+            "--enable-multimodal",
+            default=ServerArgs.enable_multimodal,
+            action="store_true",
+            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+        )
+        parser.add_argument(
+            "--disable-fast-image-processor",
+            action="store_true",
+            help="Disable the fast image processor and use the slow one instead.",
         )
         parser.add_argument(
             "--schedule-policy",

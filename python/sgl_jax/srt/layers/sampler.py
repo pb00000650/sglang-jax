@@ -333,9 +333,9 @@ def top_p_normalize_probs_jax(
 def _apply_min_p_filter(operands):
     """Apply min_p filtering when need_min_p_sampling=True"""
     inputs, min_ps, use_probs = operands
-    max_per_bs = jnp.max(inputs, axis=1)
-    min_p_thresholds = max_per_bs * min_ps
-    min_p_mask = inputs < min_p_thresholds.reshape(-1, 1)
+    max_per_bs = jnp.max(inputs, axis=-1, keepdims=True)
+    min_p_thresholds = max_per_bs * min_ps.reshape(*min_ps.shape, 1)
+    min_p_mask = inputs < min_p_thresholds
     return jnp.where(min_p_mask, 0.0, inputs)
 
 

@@ -37,14 +37,16 @@ def has_valid_data(data) -> bool:
     return True
 
 
-def select_best_resolution(original_size: Tuple[int, int], possible_resolutions: List[Tuple[int, int]]) -> Tuple[int, int]:
+def select_best_resolution(
+    original_size: Tuple[int, int], possible_resolutions: List[Tuple[int, int]]
+) -> Tuple[int, int]:
     """
     Selects the best resolution from possible resolutions based on original size.
-    
+
     Args:
         original_size: (width, height) of original image
         possible_resolutions: List of (width, height) resolution options
-        
+
     Returns:
         Best fit resolution (width, height)
     """
@@ -56,15 +58,20 @@ def select_best_resolution(original_size: Tuple[int, int], possible_resolutions:
     for width, height in possible_resolutions:
         # Calculate downscaled size maintaining aspect ratio
         scale = min(width / original_width, height / original_height)
-        downscaled_width, downscaled_height = int(original_width * scale), int(original_height * scale)
+        downscaled_width, downscaled_height = int(original_width * scale), int(
+            original_height * scale
+        )
 
         # Calculate effective and wasted resolutions
-        effective_resolution = min(downscaled_width * downscaled_height, original_width * original_height)
+        effective_resolution = min(
+            downscaled_width * downscaled_height, original_width * original_height
+        )
         wasted_resolution = (width * height) - effective_resolution
 
         # Update best fit based on effective and wasted resolution
         if effective_resolution > max_effective_resolution or (
-            effective_resolution == max_effective_resolution and wasted_resolution < min_wasted_resolution
+            effective_resolution == max_effective_resolution
+            and wasted_resolution < min_wasted_resolution
         ):
             max_effective_resolution = effective_resolution
             min_wasted_resolution = wasted_resolution
@@ -76,11 +83,11 @@ def select_best_resolution(original_size: Tuple[int, int], possible_resolutions:
 def resize_and_pad_image(image: Image.Image, target_resolution: Tuple[int, int]) -> Image.Image:
     """
     Resize and pad image to target resolution while maintaining aspect ratio.
-    
+
     Args:
         image: Input PIL Image
         target_resolution: (width, height) target resolution
-        
+
     Returns:
         Resized and padded PIL Image
     """
@@ -111,11 +118,11 @@ def resize_and_pad_image(image: Image.Image, target_resolution: Tuple[int, int])
 def divide_to_patches(image: Image.Image, patch_size: int) -> List[Image.Image]:
     """
     Divide image into patches of specified size.
-    
+
     Args:
         image: Input PIL Image
         patch_size: Size of each square patch
-        
+
     Returns:
         List of patch images
     """
@@ -130,30 +137,33 @@ def divide_to_patches(image: Image.Image, patch_size: int) -> List[Image.Image]:
 
 
 def get_anyres_image_grid_shape(
-    image_size: Tuple[int, int], 
-    grid_pinpoints: str, 
-    patch_size: int
+    image_size: Tuple[int, int], grid_pinpoints: str, patch_size: int
 ) -> Tuple[int, int]:
     """
     Calculate image patch grid shape for anyres preprocessing.
-    
+
     Args:
         image_size: (width, height) of input image
         grid_pinpoints: String describing possible resolutions
         patch_size: Size of each image patch
-        
+
     Returns:
         Grid shape (width, height) in number of patches
     """
     if isinstance(grid_pinpoints, str) and "x" in grid_pinpoints:
-        assert patch_size in [224, 336, 384, 448, 512], \
-            "patch_size should be in [224, 336, 384, 448, 512]"
-        
+        assert patch_size in [
+            224,
+            336,
+            384,
+            448,
+            512,
+        ], "patch_size should be in [224, 336, 384, 448, 512]"
+
         # Parse range from string (e.g., "(1x1)-(3x3)")
         matches = re.findall(r"\((\d+)x(\d+)\)", grid_pinpoints)
         range_start = tuple(map(int, matches[0]))
         range_end = tuple(map(int, matches[-1]))
-        
+
         # Generate grid pinpoints and scale by patch size
         grid_pinpoints = [
             (i, j)
@@ -161,25 +171,23 @@ def get_anyres_image_grid_shape(
             for j in range(range_start[1], range_end[1] + 1)
         ]
         grid_pinpoints = [[dim * patch_size for dim in pair] for pair in grid_pinpoints]
-    
-    possible_resolutions = grid_pinpoints if isinstance(grid_pinpoints, list) else ast.literal_eval(grid_pinpoints)
+
+    possible_resolutions = (
+        grid_pinpoints if isinstance(grid_pinpoints, list) else ast.literal_eval(grid_pinpoints)
+    )
     width, height = select_best_resolution(image_size, possible_resolutions)
     return width // patch_size, height // patch_size
 
 
-def process_anyres_image(
-    image: Image.Image, 
-    processor: Any, 
-    grid_pinpoints: str
-) -> np.ndarray:
+def process_anyres_image(image: Image.Image, processor: Any, grid_pinpoints: str) -> np.ndarray:
     """
     Process image with anyres resolution handling.
-    
+
     Args:
         image: Input PIL Image
         processor: Image processor object
         grid_pinpoints: String describing possible resolutions
-        
+
     Returns:
         Processed image patches as numpy array
     """
@@ -189,15 +197,20 @@ def process_anyres_image(
             patch_size = processor.size[0]
         except Exception:
             patch_size = processor.size["shortest_edge"]
-            
-        assert patch_size in [224, 336, 384, 448, 512], \
-            "patch_size should be in [224, 336, 384, 448, 512]"
-        
+
+        assert patch_size in [
+            224,
+            336,
+            384,
+            448,
+            512,
+        ], "patch_size should be in [224, 336, 384, 448, 512]"
+
         # Parse and generate grid pinpoints
         matches = re.findall(r"\((\d+)x(\d+)\)", grid_pinpoints)
         range_start = tuple(map(int, matches[0]))
         range_end = tuple(map(int, matches[-1]))
-        
+
         grid_pinpoints = [
             (i, j)
             for i in range(range_start[0], range_end[0] + 1)
@@ -205,7 +218,9 @@ def process_anyres_image(
         ]
         grid_pinpoints = [[dim * patch_size for dim in pair] for pair in grid_pinpoints]
 
-    possible_resolutions = grid_pinpoints if isinstance(grid_pinpoints, list) else ast.literal_eval(grid_pinpoints)
+    possible_resolutions = (
+        grid_pinpoints if isinstance(grid_pinpoints, list) else ast.literal_eval(grid_pinpoints)
+    )
     best_resolution = select_best_resolution(image.size, possible_resolutions)
     image_padded = resize_and_pad_image(image, best_resolution)
 
@@ -225,13 +240,12 @@ def process_anyres_image(
     patches = divide_to_patches(image_padded, crop_size)
     image_original_resize = image.resize((shortest_edge, shortest_edge))
     image_patches = [image_original_resize] + patches
-    
+
     # Preprocess all patches
     image_patches = [
-        processor.preprocess(patch.convert("RGB"))["pixel_values"][0]
-        for patch in image_patches
+        processor.preprocess(patch.convert("RGB"))["pixel_values"][0] for patch in image_patches
     ]
-    
+
     return np.stack(image_patches, axis=0)
 
 
@@ -245,11 +259,11 @@ def expand2square(pil_img: Image.Image, background_color: Tuple[int, int, int]) 
     width, height = pil_img.size
     if width == height:
         return pil_img
-    
+
     # Convert grayscale to RGB if needed
     if pil_img.mode == "L":
         pil_img = pil_img.convert("RGB")
-    
+
     # Create square background and paste image
     if width > height:
         result = Image.new(pil_img.mode, (width, width), background_color)
@@ -257,18 +271,18 @@ def expand2square(pil_img: Image.Image, background_color: Tuple[int, int, int]) 
     else:
         result = Image.new(pil_img.mode, (height, height), background_color)
         result.paste(pil_img, ((height - width) // 2, 0))
-    
+
     return result
 
 
 def unpad_image(tensor: jnp.ndarray, original_size: Tuple[int, int]) -> jnp.ndarray:
     """
     Unpad a JAX tensor of a padded and resized image.
-    
+
     Args:
         tensor: Image tensor in CxHxW format
         original_size: Original (width, height) of image
-        
+
     Returns:
         Unpadded image tensor
     """
@@ -291,9 +305,7 @@ def unpad_image(tensor: jnp.ndarray, original_size: Tuple[int, int]) -> jnp.ndar
 
 
 def unpad_image_shape(
-    current_height: int, 
-    current_width: int, 
-    original_size: Tuple[int, int]
+    current_height: int, current_width: int, original_size: Tuple[int, int]
 ) -> Tuple[int, int]:
     """Calculate unpadded image shape."""
     original_width, original_height = original_size
@@ -315,18 +327,18 @@ def unpad_image_shape(
 def process_images(images: List[Image.Image], image_processor: Any, model_cfg: Any) -> np.ndarray:
     """
     Process list of images according to model configuration.
-    
+
     Args:
         images: List of PIL Images
         image_processor: Image processor object
         model_cfg: Model configuration with image processing parameters
-        
+
     Returns:
         Processed image tensors as numpy array
     """
     image_aspect_ratio = getattr(model_cfg, "image_aspect_ratio", None)
     new_images = []
-    
+
     if image_aspect_ratio == "pad":
         # Pad images to square
         mean = tuple(int(x * 255) for x in image_processor.image_mean)
@@ -334,19 +346,17 @@ def process_images(images: List[Image.Image], image_processor: Any, model_cfg: A
             image = expand2square(image, mean)
             processed = image_processor.preprocess(image)["pixel_values"][0]
             new_images.append(processed)
-            
+
     elif "anyres" in image_aspect_ratio:
         # Process with anyres handling
         for image in images:
-            processed = process_anyres_image(
-                image, image_processor, model_cfg.image_grid_pinpoints
-            )
+            processed = process_anyres_image(image, image_processor, model_cfg.image_grid_pinpoints)
             new_images.append(processed)
-            
+
     else:
         # Default processing
         return image_processor(images)["pixel_values"]
-    
+
     # Stack if all images have same shape
     if all(x.shape == new_images[0].shape for x in new_images):
         return np.stack(new_images, axis=0)
@@ -359,43 +369,41 @@ def get_dp_encoder_lb_assignment(
 ) -> Tuple[List[int], List[int], List[int]]:
     """
     Generate load balancing assignment for data parallel distribution.
-    
+
     Args:
         sizes: Size of each image (in patches)
         num_gpus: Number of GPUs for distribution
-        
+
     Returns:
         shuffle_indices: Indices to reorder data
         gpu_sample_counts: Number of samples per GPU
         grouped_sizes_per_gpu: Total size per GPU
     """
     n_samples = len(sizes)
-    
+
     if n_samples == 0:
         return [], [0] * num_gpus, [0] * num_gpus
-    
+
     # Greedy load balancing by total size
     gpu_assignments = [[] for _ in range(num_gpus)]
     gpu_loads = [0] * num_gpus  # Tracks total size, not count
-    
+
     # Sort by size (largest first)
-    large_to_small_indices = sorted(
-        range(n_samples), key=lambda i: sizes[i], reverse=True
-    )
-    
+    large_to_small_indices = sorted(range(n_samples), key=lambda i: sizes[i], reverse=True)
+
     # Assign to GPUs with minimum current load
     for idx in large_to_small_indices:
         min_gpu = min(range(num_gpus), key=lambda i: gpu_loads[i])
         gpu_assignments[min_gpu].append(idx)
         gpu_loads[min_gpu] += sizes[idx]
-    
+
     # Prepare results
     shuffle_indices = []
     gpu_sample_counts = []
     for gpu_id in range(num_gpus):
         shuffle_indices.extend(gpu_assignments[gpu_id])
         gpu_sample_counts.append(len(gpu_assignments[gpu_id]))
-    
+
     return shuffle_indices, gpu_sample_counts, gpu_loads
 
 
@@ -408,48 +416,50 @@ def run_dp_sharded_mrope_vision_model(
 ) -> jnp.ndarray:
     """
     Run vision model with data parallel sharding in JAX.
-    
+
     Args:
         vision_model: Flax vision model
         pixel_values: Image input tensor
         grid_thw_list: List of grid dimensions for each image
         rope_type: Type of rope used ("rope_3d" or "rope_2d")
-        
+
     Returns:
         Output image embeddings
     """
     tp_size = get_tensor_model_parallel_world_size()
     tp_rank_local = get_tensor_model_parallel_rank()
-    
+
     # Calculate patches per image
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
     cum_patches_per_image = [0, *itertools.accumulate(patches_per_image)]
-    
+
     # Get load balancing assignment
-    image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
-        get_dp_encoder_lb_assignment(patches_per_image, tp_size)
+    image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = get_dp_encoder_lb_assignment(
+        patches_per_image, tp_size
     )
-    
+
     cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
-    
+
     # Get local image indices for this rank
     image_idxs_local = image_to_tp_rank[
         cum_gpu_sample_counts[tp_rank_local] : cum_gpu_sample_counts[tp_rank_local + 1]
     ]
-    
+
     # Extract local pixel values
     if len(image_idxs_local) > 0:
-        pixel_values_local = jnp.concatenate([
-            pixel_values[cum_patches_per_image[i] : cum_patches_per_image[i + 1]]
-            for i in image_idxs_local
-        ])
+        pixel_values_local = jnp.concatenate(
+            [
+                pixel_values[cum_patches_per_image[i] : cum_patches_per_image[i + 1]]
+                for i in image_idxs_local
+            ]
+        )
     else:
         # Handle empty case with correct shape/dtype
         pixel_values_local = jnp.empty(
             (0, pixel_values.shape[1]),
             dtype=pixel_values.dtype,
         )
-    
+
     # Calculate embedding dimension reduction factor
     if rope_type == "rope_2d":
         embed_dim_reduction_factor = (
@@ -459,17 +469,15 @@ def run_dp_sharded_mrope_vision_model(
         embed_dim_reduction_factor = (
             vision_model.spatial_merge_size * vision_model.spatial_merge_size
         )
-    
+
     # Determine max length for padding
     max_len_per_rank = max(grouped_pixel_values_len) // embed_dim_reduction_factor
     local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
-    
+
     # Run vision model on local data
     if rope_type == "rope_2d":
         if pixel_values_local.shape[0] > 0:
-            image_embeds_local = vision_model(
-                pixel_values_local, jnp.array(local_grid_thw_list)
-            )
+            image_embeds_local = vision_model(pixel_values_local, jnp.array(local_grid_thw_list))
             if isinstance(image_embeds_local, list):
                 image_embeds_local = jnp.concatenate(image_embeds_local, axis=0)
         else:
@@ -480,15 +488,13 @@ def run_dp_sharded_mrope_vision_model(
             )
     else:
         if pixel_values_local.shape[0] > 0:
-            image_embeds_local = vision_model(
-                pixel_values_local, jnp.array(local_grid_thw_list)
-            )
+            image_embeds_local = vision_model(pixel_values_local, jnp.array(local_grid_thw_list))
         else:
             image_embeds_local = jnp.empty(
                 (0, vision_model.out_hidden_size),
                 dtype=pixel_values.dtype,
             )
-    
+
     # Pad to max length for all-gather
     current_len = image_embeds_local.shape[0]
     if current_len < max_len_per_rank:
@@ -506,22 +512,22 @@ def run_dp_sharded_mrope_vision_model(
         image_embeds_local_padded = jnp.concatenate([image_embeds_local, padding], axis=0)
     else:
         image_embeds_local_padded = image_embeds_local
-    
+
     # All-gather from all ranks
     gathered_embeds = tensor_model_parallel_all_gather(image_embeds_local_padded, dim=0)
-    
+
     # Reconstruct per-rank embeddings
     rank_embeddings = []
     for rank in range(tp_size):
         start_idx = rank * max_len_per_rank
         end_idx = start_idx + (grouped_pixel_values_len[rank] // embed_dim_reduction_factor)
         rank_embeddings.append(gathered_embeds[start_idx:end_idx])
-    
+
     # Calculate patches per output image
     patches_per_output_image = [
         (patch_size // embed_dim_reduction_factor) for patch_size in patches_per_image
     ]
-    
+
     # Reconstruct original order
     original_order_embeddings = [None] * len(grid_thw_list)
     current_idx = 0
@@ -530,13 +536,15 @@ def run_dp_sharded_mrope_vision_model(
         if count > 0:
             rank_images = image_to_tp_rank[current_idx : current_idx + count]
             rank_embed = rank_embeddings[rank]
-            
+
             embed_start = 0
             for img_idx in rank_images:
                 img_patches = patches_per_output_image[img_idx]
-                original_order_embeddings[img_idx] = rank_embed[embed_start : embed_start + img_patches]
+                original_order_embeddings[img_idx] = rank_embed[
+                    embed_start : embed_start + img_patches
+                ]
                 embed_start += img_patches
-            
+
             current_idx += count
-    
+
     return jnp.concatenate(original_order_embeddings, dim=0)
