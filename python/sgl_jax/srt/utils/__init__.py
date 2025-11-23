@@ -19,4 +19,5 @@ from .common_utils import (
     load_image,
     load_video,
     logger,
+    ImageData,
 )
