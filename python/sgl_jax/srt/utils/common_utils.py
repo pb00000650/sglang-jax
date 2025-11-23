@@ -32,7 +32,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Optional, Literal, Union, Tuple, bytes
+from typing import Any, Optional, Literal, Union
 from functools import lru_cache
 
 import numpy as np
