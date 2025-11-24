@@ -260,7 +260,7 @@ class BaseMultimodalProcessor(ABC):
         result = processor.__call__(
             text=[input_text],
             padding=True,
-            return_tensors="pt",** kwargs,
+            return_tensors="jax",** kwargs,
         )
 
         # Convert all tensors to JAX arrays
@@ -631,7 +631,7 @@ class BaseMultimodalProcessor(ABC):
         if not all_items:
             input_ids = self._processor.tokenizer(
                 base_output.input_text,
-                return_tensors="pt",
+                return_tensors="jax",
                 add_special_tokens=True,
             ).input_ids.flatten()
             # Convert to JAX array
@@ -676,7 +676,7 @@ class BaseMultimodalProcessor(ABC):
         if input_ids is None:
             input_ids = self._processor.tokenizer(
                 base_output.input_text,
-                return_tensors="pt",
+                return_tensors="jax",
                 add_special_tokens=True,
             ).input_ids.flatten()
             # Convert to JAX array
