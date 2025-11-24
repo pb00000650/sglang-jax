@@ -122,6 +122,7 @@ class ServerArgs:
     enable_precision_tracer: bool = False
     disable_fast_image_processor: bool = False
 
+
     # Kernel backend
     attention_backend: str | None = "fa"
 

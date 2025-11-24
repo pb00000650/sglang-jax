@@ -192,7 +192,6 @@ def get_tokenizer(
         )
 
     try:
-        from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
             *args,
@@ -268,8 +267,7 @@ def get_processor(
 
     if config.model_type not in {"llava", "clip"}:
         kwargs["use_fast"] = use_fast
-    from transformers import AutoTokenizer
-    processor = AutoTokenizer.from_pretrained(
+    processor = AutoProcessor.from_pretrained(
         tokenizer_name,
         *args,
         trust_remote_code=trust_remote_code,

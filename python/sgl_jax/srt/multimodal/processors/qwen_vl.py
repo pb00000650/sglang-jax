@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from PIL import Image
 
-# from sgl_jax.srt.layers.rotary_embedding import MRotaryEmbedding
+from sgl_jax.srt.layers.rotary_embedding import MRotaryEmbedding
 from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sgl_jax.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangJaxBaseProcessor,
@@ -297,27 +297,27 @@ class QwenVLImageProcessor(SGLangJaxBaseProcessor):
 
         input_ids = input_ids.flatten()
 
-        # mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
-        #     spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
-        #     image_token_id=self.mm_tokens.image_token_id,
-        #     video_token_id=self.mm_tokens.video_token_id,
-        #     vision_start_token_id=self.vision_start_token_id,
-        #     model_type=self.model_type,
-        #     tokens_per_second=getattr(
-        #         self.hf_config.vision_config, "tokens_per_second", None
-        #     ),
-        #     input_ids=jnp.expand_dims(input_ids, 0),  # 使用JAX数组
-        #     image_grid_thw=getattr(ret, "image_grid_thw", None),
-        #     video_grid_thw=getattr(ret, "video_grid_thw", None),
-        #     second_per_grid_ts=second_per_grid_ts,
-        #     use_audio_in_video=False,
-        #     audio_seqlens=audio_feature_lengths,
-        #     audio_token_id=getattr(self.hf_config, "audio_token_id", None),
-        #     audio_start_token_id=self.audio_start_token_id,
-        #     position_id_per_seconds=getattr(
-        #         self.hf_config, "position_id_per_seconds", None
-        #     ),
-        # )
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+            image_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+            model_type=self.model_type,
+            tokens_per_second=getattr(
+                self.hf_config.vision_config, "tokens_per_second", None
+            ),
+            input_ids=jnp.expand_dims(input_ids, 0),  # 使用JAX数组
+            image_grid_thw=getattr(ret, "image_grid_thw", None),
+            video_grid_thw=getattr(ret, "video_grid_thw", None),
+            second_per_grid_ts=second_per_grid_ts,
+            use_audio_in_video=False,
+            audio_seqlens=audio_feature_lengths,
+            audio_token_id=getattr(self.hf_config, "audio_token_id", None),
+            audio_start_token_id=self.audio_start_token_id,
+            position_id_per_seconds=getattr(
+                self.hf_config, "position_id_per_seconds", None
+            ),
+        )
         mrope_positions = mrope_positions.squeeze(1)
         get_rope_index_time = time.perf_counter()
         logger.debug(

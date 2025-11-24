@@ -84,7 +84,7 @@ class MultimodalSpecialTokens:
             return token
         if isinstance(token, str):
             return token
-        return processor.convert_ids_to_tokens([token])[0]
+        return processor.tokenizer.convert_ids_to_tokens([token])[0]
 
     def convert_to_strs(self, processor):
         if not self.image_token:
@@ -260,7 +260,7 @@ class BaseMultimodalProcessor(ABC):
         result = processor.__call__(
             text=[input_text],
             padding=True,
-            return_tensors="jax",** kwargs,
+            return_tensors="pt",** kwargs,
         )
 
         # Convert all tensors to JAX arrays
@@ -273,7 +273,7 @@ class BaseMultimodalProcessor(ABC):
                 result[key] = jnp.array(result[key])
 
         # Move to device if specified
-        if device is not None and not self.server_args.keep_mm_feature_on_device:
+        if device is not None:
             for feature_name in self.FEATURE_NAMES:
                 if feature_name in result:
                     result[feature_name] = jax.device_put(result[feature_name], device)

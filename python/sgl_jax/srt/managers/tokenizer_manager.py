@@ -169,11 +169,6 @@ class TokenizerManager:
 
             import_processors("sgl_jax.srt.multimodal.processors")
             try:
-                print(f"server_args.tokenizer_path {server_args.tokenizer_path}")
-                print(f"server_args.tokenizer_mode {server_args.tokenizer_mode}")
-                print(f"server_args.trust_remote_code {server_args.trust_remote_code}")
-                print(f"server_args.revision {server_args.revision}")
-                print(f"server_args.disable_fast_image_processor {server_args.disable_fast_image_processor}")
                 _processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,

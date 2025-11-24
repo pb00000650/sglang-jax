@@ -11,7 +11,7 @@ from sgl_jax.srt.utils import ImageData
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
-    from PIL.Image import Image
+    from PIL import Image
 else:
     Image = Any
 

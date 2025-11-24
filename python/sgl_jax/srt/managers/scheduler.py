@@ -579,6 +579,15 @@ class Scheduler(
 
     def process_input_requests(self, recv_reqs: list):
         for recv_req in recv_reqs:
+            # If it is a health check generation request and there are running requests, ignore it.
+            if is_health_check_generate_req(recv_req) and (
+                self.chunked_req is not None
+                or not self.running_batch.is_empty()
+                or len(self.offload_tags) > 0
+            ):
+                self.return_health_check_ct += 1
+                continue
+
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
@@ -1337,6 +1346,10 @@ class Scheduler(
                 logger.debug("Abort running request. rid=%s", req.rid)
                 req.to_abort = True
 
+
+def is_health_check_generate_req(recv_req):
+    rid = getattr(recv_req, "rid", None)
+    return rid is not None and rid.startswith("HEALTH_CHECK")
 
 def run_scheduler_process(
     server_args: ServerArgs,
