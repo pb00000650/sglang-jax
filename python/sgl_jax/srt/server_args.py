@@ -152,6 +152,11 @@ class ServerArgs:
     # For sampling
     use_sort_for_toppk_minp: bool = False
 
+    # For Multi-Modal
+    mm_max_concurrent_calls: int = 32
+    mm_per_request_timeout: float = 10.0
+    enable_broadcast_mm_inputs_process: bool = False
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -589,6 +594,26 @@ class ServerArgs:
             type=json.loads,
             default=ServerArgs.mm_process_config,
             help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+        )
+
+        # For Multi-Modal
+        parser.add_argument(
+            "--mm-max-concurrent-calls",
+            type=int,
+            default=ServerArgs.mm_max_concurrent_calls,
+            help="The max concurrent calls for async mm data processing.",
+        )
+        parser.add_argument(
+            "--mm-per-request-timeout",
+            type=int,
+            default=ServerArgs.mm_per_request_timeout,
+            help="The timeout for each multi-modal request in seconds.",
+        )
+        parser.add_argument(
+            "--enable-broadcast-mm-inputs-process",
+            action="store_true",
+            default=ServerArgs.enable_broadcast_mm_inputs_process,
+            help="Enable broadcast mm-inputs process in scheduler.",
         )
 
         # Logging

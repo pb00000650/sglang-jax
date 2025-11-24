@@ -1,6 +1,6 @@
 import hashlib
 import pickle
-from typing import Any
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -8,6 +8,11 @@ import numpy as np
 
 from sgl_jax.srt.layers.multimodal import gpu_tensor_hash
 from sgl_jax.srt.utils import flatten_nested_list
+
+
+# TODO(mick): nccl
+# cuda_ipc: for intranode tensor sharing
+TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
 
 def hash_feature(f: Any) -> int:

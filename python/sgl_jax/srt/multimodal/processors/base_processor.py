@@ -84,7 +84,7 @@ class MultimodalSpecialTokens:
             return token
         if isinstance(token, str):
             return token
-        return processor.tokenizer.convert_ids_to_tokens([token])[0]
+        return processor.convert_ids_to_tokens([token])[0]
 
     def convert_to_strs(self, processor):
         if not self.image_token:
@@ -169,11 +169,11 @@ class BaseMultimodalProcessor(ABC):
         self.NUM_TOKEN_PER_FRAME = 330
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=int(os.environ.get("SGLANG_IO_WORKERS", 4))
+            max_workers=int(os.environ.get("SGLANG_JAX_IO_WORKERS", 4))
         )
         self.cpu_executor = concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context("fork"),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+            max_workers=int(os.environ.get("SGLANG_JAX_CPU_WORKERS", os.cpu_count())),
         )
 
         # Mapping from attribute names to modality types

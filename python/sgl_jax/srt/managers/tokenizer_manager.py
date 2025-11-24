@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
-from typing import Any
+from typing import Any, Dict, List
 
 import fastapi
 import jax
@@ -28,6 +28,8 @@ from fastapi import BackgroundTasks
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sgl_jax.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -65,11 +67,25 @@ from sgl_jax.srt.utils import (
     kill_process_tree,
 )
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
+from sgl_jax.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
+from sgl_jax.srt.managers.mm_utils import TensorTransportMode
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = logging.getLogger(__name__)
 
+def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+    is_cross_node = server_args.dist_init_addr
+
+    if is_cross_node:
+        # Fallback to default CPU transport for multi-node
+        return "default"
+    else:
+        return "cuda_ipc"
 
 @dataclasses.dataclass
 class ReqState:
@@ -146,6 +162,74 @@ class TokenizerManager:
         self._cond = asyncio.Condition()
 
         self.mm_processor = None
+
+         # Initialize tokenizer and processor
+        if self.model_config.is_multimodal:
+
+
+            import_processors("sgl_jax.srt.multimodal.processors")
+            try:
+                print(f"server_args.tokenizer_path {server_args.tokenizer_path}")
+                print(f"server_args.tokenizer_mode {server_args.tokenizer_mode}")
+                print(f"server_args.trust_remote_code {server_args.trust_remote_code}")
+                print(f"server_args.revision {server_args.revision}")
+                print(f"server_args.disable_fast_image_processor {server_args.disable_fast_image_processor}")
+                _processor = get_processor(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                    use_fast=not server_args.disable_fast_image_processor,
+                )
+            except ValueError as e:
+                error_message = str(e)
+                if "does not have a slow version" in error_message:
+                    logger.info(
+                        f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
+                    )
+                    _processor = get_processor(
+                        server_args.tokenizer_path,
+                        tokenizer_mode=server_args.tokenizer_mode,
+                        trust_remote_code=server_args.trust_remote_code,
+                        revision=server_args.revision,
+                        use_fast=True,
+                    )
+                else:
+                    raise e
+            transport_mode = _determine_tensor_transport_mode(self.server_args)
+
+            # We want to parallelize the image pre-processing so we create an executor for it
+            # We create mm_processor for any skip_tokenizer_init to make sure we still encode
+            # images even with skip_tokenizer_init=False.
+            self.mm_processor = get_mm_processor(
+                self.model_config.hf_config, server_args, _processor, transport_mode
+            )
+            self.mm_data_processor = AsyncMMDataProcessor(
+                self.mm_processor,
+                max_concurrent_calls=self.server_args.mm_max_concurrent_calls,
+                timeout_s=self.server_args.mm_per_request_timeout,
+            )
+
+            if server_args.skip_tokenizer_init:
+                self.tokenizer = self.processor = None
+            else:
+                self.processor = _processor
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
+                os.environ["TOKENIZERS_PARALLELISM"] = "false"
+                self._initialize_multi_item_delimiter_text()
+        else:
+            self.mm_processor = self.processor = None
+
+            if server_args.skip_tokenizer_init:
+                self.tokenizer = None
+            else:
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
+                self._initialize_multi_item_delimiter_text()
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -283,8 +367,70 @@ class TokenizerManager:
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
+
+        if self.mm_processor and obj.contains_mm_input():
+            if obj.image_data is not None and not isinstance(obj.image_data, list):
+                obj.image_data = [obj.image_data]
+            if obj.audio_data is not None and not isinstance(obj.audio_data, list):
+                obj.audio_data = [obj.audio_data]
+            mm_inputs: Dict = await self.mm_data_processor.process(
+                image_data=obj.image_data,
+                audio_data=obj.audio_data,
+                input_text_or_ids=(input_text or input_ids),
+                request_obj=obj,
+                max_req_input_len=self.max_req_input_len,
+            )
+            if mm_inputs and "input_ids" in mm_inputs:
+                input_ids = mm_inputs["input_ids"]
+        else:
+            mm_inputs = None
+
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(obj, input_text, input_ids)
+
+    def _initialize_multi_item_delimiter_text(self):
+        """Initialize multi-item delimiter text from token ID after tokenizer is loaded."""
+        if (
+            hasattr(self.server_args, "multi_item_scoring_delimiter")
+            and self.server_args.multi_item_scoring_delimiter is not None
+            and self.tokenizer is not None
+        ):
+            try:
+                self.multi_item_delimiter_text = self.tokenizer.decode(
+                    [self.server_args.multi_item_scoring_delimiter],
+                    skip_special_tokens=False,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to decode delimiter token {self.server_args.multi_item_scoring_delimiter}: {e}"
+                )
+                self.multi_item_delimiter_text = None
+
+    def _build_multi_item_token_sequence(
+        self, query: List[int], items: List[List[int]], delimiter_token_id: int
+    ) -> List[int]:
+        """
+        Build a single token sequence for multi-item scoring.
+        Format: query<delimiter>item1<delimiter>item2<delimiter>item3<delimiter>
+
+        Args:
+            query: Query token IDs
+            items: List of item token ID sequences
+            delimiter_token_id: Token ID to use as delimiter
+
+        Returns:
+            Combined token sequence
+        """
+        combined_sequence = query[:]  # Start with query
+
+        for item in items:
+            combined_sequence.append(delimiter_token_id)  # Add delimiter
+            combined_sequence.extend(item)  # Add item tokens
+
+        # Add final delimiter after the last item for logprob extraction
+        combined_sequence.append(delimiter_token_id)
+
+        return combined_sequence
 
     def _validate_one_request(
         self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
