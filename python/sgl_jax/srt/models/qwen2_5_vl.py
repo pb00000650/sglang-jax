@@ -1,11 +1,20 @@
+import math
 import logging
-from typing import Any, Optional, Tuple, List, Dict, Union
+from functools import partial
+from typing import Callable, List, Literal, NamedTuple, Optional, TypedDict, Union
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
-from transformers import PretrainedConfig
+from jax.sharding import Mesh
+from transformers import modeling_flax_utils
+from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
+    Qwen2_5_VLConfig,
+    Qwen2_5_VLVisionConfig,
+)
 
+from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -13,545 +22,563 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.layers.logits_processor import LogitsProcessor, LogitsMetadata
+from sgl_jax.srt.models.qwen2 import (
+    Qwen2Model,
+    Qwen2ForCausalLM,
+    Qwen2DecoderLayer,
+    Qwen2Attention,
+    Qwen2MLP,
+)
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
-from sgl_jax.srt.configs.model_config import ModelConfig
 
-# 配置日志
+init_fn = nnx.initializers.uniform()
+DEFAULT_BLOCK_K_MAJOR = 128
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+
+class SegmentIds(NamedTuple):
+    q: jax.Array  # [batch_size, q_seq_len]
+    kv: jax.Array  # [batch_size, kv_seq_len]
 
 
-class Qwen2_5VLMLP(nnx.Module):
+class Qwen2_5_VLImagePixelInputs(TypedDict):
+    type: Literal["pixel_values"]
+    pixel_values: jax.Array
+    image_grid_thw: tuple[tuple[int, int, int], ...]
+
+
+class Qwen2_5_VLImageEmbeddingInputs(TypedDict):
+    type: Literal["image_embeds"]
+    image_embeds: jax.Array
+    image_grid_thw: jax.Array
+
+
+Qwen2_5_VLImageInputs = Union[Qwen2_5_VLImagePixelInputs, Qwen2_5_VLImageEmbeddingInputs]
+
+
+class Qwen2_5_VisionMLP(nnx.Module):
     def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        layer_id: int = 0,
-        rngs: Optional[nnx.Rngs] = None,
-        dtype: jnp.dtype = jnp.bfloat16,
-        mesh: Optional[jax.sharding.Mesh] = None,
-    ) -> None:
-        self.layer_id = layer_id
+        self, config: Qwen2_5_VLVisionConfig, dtype: jnp.dtype, rngs: nnx.Rngs, mesh: Mesh
+    ):
+        in_features = config.hidden_size
+        hidden_features = config.intermediate_size
+        act_fn = modeling_flax_utils.ACT2FN[config.hidden_act]
+
         self.gate_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=intermediate_size,
+            input_size=in_features,
+            output_size=hidden_features,
+            use_bias=True,
             kernel_axes=(None, "tensor"),
-            use_bias=False,
             params_dtype=dtype,
             rngs=rngs,
             mesh=mesh,
         )
         self.up_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=intermediate_size,
+            input_size=in_features,
+            output_size=hidden_features,
+            use_bias=True,
             kernel_axes=(None, "tensor"),
-            use_bias=False,
             params_dtype=dtype,
             rngs=rngs,
             mesh=mesh,
         )
         self.down_proj = LinearBase(
-            input_size=intermediate_size,
-            output_size=hidden_size,
+            input_size=hidden_features,
+            output_size=in_features,
+            use_bias=True,
             kernel_axes=("tensor", None),
-            use_bias=False,
             params_dtype=dtype,
             rngs=rngs,
             mesh=mesh,
         )
-        self.act_fn = jax.nn.silu
+        self.act_fn = act_fn
 
-    def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
-        gate, _ = self.gate_proj(hidden_states)
-        up, _ = self.up_proj(hidden_states)
-        intermediate = up * self.act_fn(gate)
-        output, _ = self.down_proj(intermediate)
+    def __call__(self, x: jax.Array) -> jax.Array:
+        gate = self.act_fn(self.gate_proj(x)[0])
+        up = self.up_proj(x)[0]
+        fuse = gate * up
+        result = self.down_proj(fuse)[0]
+        return result
+
+
+def apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax.Array:
+    _, _, _, H = x.shape
+    half_dim = H // 2
+
+    x_real = x[..., :half_dim]
+    x_imag = x[..., half_dim:]
+
+    cos_emb = jnp.cos(rotary_pos_emb)
+    sin_emb = jnp.sin(rotary_pos_emb)
+
+    cos_emb = cos_emb[None, :, None, :]
+    sin_emb = sin_emb[None, :, None, :]
+
+    x_rotated_real = x_real * cos_emb - x_imag * sin_emb
+    x_rotated_imag = x_real * sin_emb + x_imag * cos_emb
+
+    return jnp.concatenate([x_rotated_real, x_rotated_imag], axis=-1)
+
+
+def generate_window_segment_ids(
+    cu_seqlens: jax.Array, seq_len: int, padded_seq_len: int
+) -> SegmentIds:
+    indices = jnp.arange(seq_len, dtype=jnp.int32)
+    segment_ids = jnp.searchsorted(cu_seqlens[1:], indices, side="right") + 1
+    padding_segment_ids = jnp.zeros(padded_seq_len - seq_len, dtype=jnp.int32)
+    segment_ids = jnp.concatenate([segment_ids, padding_segment_ids])
+    segment_ids = segment_ids.reshape(1, -1)
+
+    return SegmentIds(q=segment_ids, kv=segment_ids)
+
+
+class Qwen2_5_VisionAttention(nnx.Module):
+    def __init__(self, config: Qwen2_5_VLConfig, dtype: jnp.dtype, rngs: nnx.Rngs, mesh: Mesh):
+        vision_config = config.vision_config
+        self.hidden_size = vision_config.hidden_size
+        self.num_heads = vision_config.num_heads
+        self.num_kv_heads = self.num_heads
+        self.head_dim_original = self.hidden_size // self.num_heads
+        self.head_dim = self.head_dim_original
+        self.mesh = mesh
+
+        self.qkv_proj = LinearBase(
+            input_size=self.hidden_size,
+            output_size=3 * self.hidden_size,
+            use_bias=True,
+            kernel_axes=(None, "tensor"),
+            params_dtype=dtype,
+            rngs=rngs,
+            mesh=mesh,
+        )
+
+        self.proj = LinearBase(
+            input_size=self.hidden_size,
+            output_size=self.hidden_size,
+            use_bias=True,
+            kernel_axes=("tensor", None),
+            params_dtype=dtype,
+            rngs=rngs,
+            mesh=mesh,
+        )
+
+        self.attn = RadixAttention(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scaling=1.0 / math.sqrt(self.head_dim),
+            num_kv_heads=self.num_kv_heads,
+            layer_id=0,
+        )
+
+    def __call__(
+        self,
+        x: jax.Array,
+        rotary_pos_emb: jax.Array,
+        cu_window_seqlens: Optional[jax.Array] = None,
+        use_fullattn: bool = True,
+    ) -> jax.Array:
+        T, B, D = x.shape
+        qkv, _ = self.qkv_proj(x)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+
+        q = q.reshape(T, B, self.num_heads, self.head_dim)
+        k = k.reshape(T, B, self.num_heads, self.head_dim)
+        v = v.reshape(T, B, self.num_heads, self.head_dim)
+
+        q = jnp.transpose(q, (1, 0, 2, 3))
+        k = jnp.transpose(k, (1, 0, 2, 3))
+        v = jnp.transpose(v, (1, 0, 2, 3))
+
+        q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
+        k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
+
+        q = jnp.transpose(q, (0, 2, 1, 3))
+        k = jnp.transpose(k, (0, 2, 1, 3))
+        v = jnp.transpose(v, (0, 2, 1, 3))
+
+        block_k_major = DEFAULT_BLOCK_K_MAJOR
+        T_attn = q.shape[2]
+        padded_T = (T_attn + block_k_major - 1) // block_k_major * block_k_major
+        pad_width = ((0, 0), (0, 0), (0, padded_T - T_attn), (0, 0))
+
+        q = jnp.pad(q, pad_width, "constant")
+        k = jnp.pad(k, pad_width, "constant")
+        v = jnp.pad(v, pad_width, "constant")
+
+        segment_ids = generate_window_segment_ids(cu_window_seqlens, T_attn, padded_T)
+
+        forward_batch = ForwardBatch(
+            input_ids=jnp.zeros((1, padded_T), dtype=jnp.int32),
+            positions=jnp.arange(padded_T),
+            cu_seq_lens=jnp.array([0, padded_T], dtype=jnp.int32),
+            slot_mapping=jnp.arange(padded_T),
+        )
+        kv_cache = KVCache()
+
+        attn_output, _ = self.attn(q, k, v, forward_batch, kv_cache)
+        attn_output = attn_output[:, :, :T_attn, :]
+        attn_output = jnp.transpose(attn_output, (2, 0, 1, 3))
+        attn_output = attn_output.reshape(T, B, D)
+
+        output, _ = self.proj(attn_output)
         return output
 
 
-class Qwen2_5VLAttention(nnx.Module):
+class Qwen2_5_VisionBlock(nnx.Module):
+    def __init__(self, config: Qwen2_5_VLConfig, dtype: jnp.dtype, rngs: nnx.Rngs, mesh: Mesh):
+        vision_config = config.vision_config
+        dim = vision_config.hidden_size
+        norm_layer = partial(RMSNorm, epsilon=config.rms_norm_eps)
+
+        self.norm1 = norm_layer(dim, param_dtype=dtype, rngs=rngs)
+        self.norm2 = norm_layer(dim, param_dtype=dtype, rngs=rngs)
+        self.attn = Qwen2_5_VisionAttention(config=config, dtype=dtype, rngs=rngs, mesh=mesh)
+        self.mlp = Qwen2_5_VisionMLP(config=vision_config, dtype=dtype, rngs=rngs, mesh=mesh)
+
+    def __call__(
+        self,
+        x: jax.Array,
+        rotary_pos_emb: jax.Array,
+        cu_window_seqlens: Optional[jax.Array] = None,
+        use_fullattn: bool = True,
+    ) -> jax.Array:
+
+        x = x + self.attn(self.norm1(x), rotary_pos_emb, cu_window_seqlens, use_fullattn)
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class Qwen2_5_VisionPatchEmbed(nnx.Module):
     def __init__(
         self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        max_position_embeddings: int,
-        rope_theta: float = 1000000,
-        rope_scaling: Optional[dict[str, Any]] = None,
-        head_dim: Optional[int] = None,
-        layer_id: int = 0,
+        rngs: nnx.Rngs,
+        patch_size: int = 14,
+        temporal_patch_size: int = 2,
+        in_channels: int = 3,
+        hidden_size: int = 1152,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: Optional[nnx.Rngs] = None,
-        mesh: Optional[jax.sharding.Mesh] = None,
-    ):
-        self.layer_id = layer_id
-        assert num_heads % num_kv_heads == 0, "Num heads must be divisible by num kv heads"
-        self.head_dim = head_dim or hidden_size // num_heads
-        self.q_head_num = num_heads
-        self.kv_head_num = num_kv_heads
+        mesh: Mesh = None,
+    ) -> None:
+        self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
+        self.hidden_size = hidden_size
 
-        self.q_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=num_heads * self.head_dim,
-            use_bias=True,
-            kernel_axes=(None, "tensor"),
-            rngs=rngs,
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-        self.k_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=num_kv_heads * self.head_dim,
-            use_bias=True,
-            kernel_axes=(None, "tensor"),
-            rngs=rngs,
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-        self.v_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=num_kv_heads * self.head_dim,
-            use_bias=True,
-            kernel_axes=(None, "tensor"),
-            rngs=rngs,
-            params_dtype=dtype,
-            mesh=mesh,
-        )
-        self.o_proj = LinearBase(
-            input_size=num_heads * self.head_dim,
+        self.proj = LinearBase(
+            input_size=in_channels * temporal_patch_size * patch_size * patch_size,
             output_size=hidden_size,
             use_bias=False,
-            kernel_axes=("tensor", None),
-            rngs=rngs,
+            kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            rngs=rngs,
             mesh=mesh,
         )
-        self.rotary_emb = RotaryEmbedding(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position_embeddings=max_position_embeddings,
-            base=rope_theta,
-            is_neox_style=True,
-            dtype=dtype,
-        )
-        self.attn = RadixAttention(
-            num_heads=num_heads,
-            head_dim=self.head_dim,
-            scaling=self.head_dim**-0.5,
-            num_kv_heads=num_kv_heads,
-            layer_id=layer_id,
-        )
 
-    def __call__(
-        self,
-        positions: jax.Array,
-        hidden_states: jax.Array,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
-    ) -> tuple[jax.Array, jax.Array]:
-        """
-        Args:
-            positions: 位置编码张量，形状为 [total_tokens]
-            hidden_states: 输入隐藏状态，形状为 [total_tokens, hidden_size]
-            forward_batch: 包含批量处理信息的ForwardBatch对象
-            token_to_kv_pool: KV缓存池对象，用于存储和更新键值缓存
-
-        Returns:
-            注意力输出张量和融合的KV缓存张量
-        """
-        # 投影得到Q、K、V
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
-
-        # 重塑为多头格式并指定分片策略
-        from jax.sharding import PartitionSpec as P
-
-        q = q.reshape(
-            (-1, self.q_head_num, self.head_dim),
-            out_sharding=P(None, "tensor", None),  # 保持在注意力头维度的分片
-        )
-        k = k.reshape((-1, self.kv_head_num, self.head_dim), out_sharding=P(None, "tensor", None))
-        v = v.reshape((-1, self.kv_head_num, self.head_dim), out_sharding=P(None, "tensor", None))
-
-        # 应用旋转位置编码（适配视觉-语言模型的位置处理）
-        if self.rotary_emb is not None:
-            q, k = self.rotary_emb(positions, q, k)
-
-        # 调用注意力计算核心逻辑
-        attn_output, kv_fused = self.attn(
-            q, k, v, forward_batch=forward_batch, token_to_kv_pool=token_to_kv_pool
-        )
-
-        # 投影回隐藏状态维度
-        output, _ = self.o_proj(attn_output)
-        return output, kv_fused
+    def __call__(self, x: jax.Array) -> jax.Array:
+        output, _ = self.proj(x)
+        return output
 
 
-class Qwen2_5VLDecoderLayer(nnx.Module):
+class Qwen2_5_VisionPatchMerger(nnx.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
-        layer_id: int = 0,
-        dtype: jnp.dtype = jnp.bfloat16,
-        rngs: Optional[nnx.Rngs] = None,
-        mesh: Optional[jax.sharding.Mesh] = None,
+        d_model: int,
+        context_dim: int,
+        norm_layer: Callable,
+        spatial_merge_size: int,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs,
+        mesh: Mesh,
     ):
-        self.layer_id = layer_id
-        self.hidden_size = config.hidden_size
-        # 修复注意力头参数获取逻辑
-        num_attention_heads = getattr(
-            config, "num_attention_heads", getattr(config, "num_heads", 0)
-        )
-        num_key_value_heads = getattr(
-            config, "num_key_value_heads", getattr(config, "num_kv_heads", num_attention_heads)
-        )
-
-        self.self_attn = Qwen2_5VLAttention(
-            hidden_size=config.hidden_size,
-            num_heads=num_attention_heads,
-            num_kv_heads=num_key_value_heads,
-            max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
-            rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
-            head_dim=getattr(config, "head_dim", None),
-            layer_id=layer_id,
-            dtype=dtype,
+        self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.ln_q = norm_layer(context_dim, param_dtype=dtype, rngs=rngs)
+        self.mlp_fc1 = LinearBase(
+            input_size=self.hidden_size,
+            output_size=self.hidden_size,
+            use_bias=True,
+            kernel_axes=(None, "tensor"),
+            params_dtype=dtype,
             rngs=rngs,
             mesh=mesh,
         )
-        self.mlp = Qwen2_5VLMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            layer_id=layer_id,
-            dtype=dtype,
-            rngs=rngs,
-            mesh=mesh,
-        )
-        self.input_layernorm = RMSNorm(
-            config.hidden_size,
-            epsilon=getattr(config, "rms_norm_eps", 1e-6),
-            param_dtype=dtype,
-            rngs=rngs,
-        )
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size,
-            epsilon=getattr(config, "rms_norm_eps", 1e-6),
-            param_dtype=dtype,
-            rngs=rngs,
-        )
-
-    def __call__(
-        self,
-        positions: jax.Array,
-        hidden_states: jax.Array,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
-        residual: Optional[jax.Array] = None,
-    ) -> Tuple[jax.Array, jax.Array, jax.Array, List[Any]]:
-        layer_callback_flag: List[Any] = []
-
-        # 初始输入维度检查与修复
-        if hidden_states.ndim != 3:
-            # logger.warning(
-            #     f"hidden_states 期望3D，实际{hidden_states.ndim}D，形状: {hidden_states.shape}"
-            # )
-            # 尝试从批次信息推断维度
-            batch_size = forward_batch.batch_size
-            if hidden_states.ndim == 2:
-                seq_len = hidden_states.shape[0] // batch_size
-                hidden_size = hidden_states.shape[1]
-                hidden_states = hidden_states.reshape(batch_size, seq_len, hidden_size)
-                #logger.info(f"修复 hidden_states 为3D: {hidden_states.shape}")
-            else:
-                raise ValueError(f"无法修复 hidden_states 维度: {hidden_states.shape}")
-
-        # 处理残差连接和输入层归一化
-        if residual is None:
-            # 初始化残差时确保3D
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            # 检查残差维度并修复
-            if residual.ndim != 3:
-                #logger.warning(f"residual 期望3D，实际{residual.ndim}D，形状: {residual.shape}")
-                batch_size = forward_batch.batch_size
-                if residual.ndim == 2:
-                    seq_len = residual.shape[0] // batch_size
-                    hidden_size = residual.shape[1]
-                    residual = residual.reshape(batch_size, seq_len, hidden_size)
-                    #logger.info(f"修复 residual 为3D: {residual.shape}")
-                else:
-                    raise ValueError(f"无法修复 residual 维度: {residual.shape}")
-
-            hidden_states += residual
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-
-        # 注意力计算
-        attn_output, kv_fused = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            token_to_kv_pool=token_to_kv_pool,
-        )
-
-        # 验证并修复注意力输出维度
-        if attn_output.ndim != 3:
-            # logger.warning(
-            #     f"attn_output 期望3D，实际{attn_output.ndim}D，形状: {attn_output.shape}"
-            # )
-
-            # 从残差和批次信息推断正确维度
-            batch_size = forward_batch.batch_size
-            if residual.ndim == 3:
-                target_shape = residual.shape
-            else:
-                seq_len = attn_output.shape[0] // batch_size
-                hidden_size = attn_output.shape[-1]
-                target_shape = (batch_size, seq_len, hidden_size)
-
-            # 尝试修复
-            if attn_output.ndim == 2:
-                try:
-                    attn_output = attn_output.reshape(target_shape)
-                    #logger.info(f"修复 attn_output 为3D: {attn_output.shape}")
-                except ValueError as e:
-                    logger.error(f"修复失败: {e}")
-                    raise
-            else:
-                raise ValueError(f"无法修复注意力输出维度: {attn_output.shape}")
-
-        hidden_states = attn_output
-
-        # 残差连接和后注意力层归一化
-        hidden_states += residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-
-        # MLP计算
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual, kv_fused, layer_callback_flag
-
-
-class Qwen2_5VLModel(nnx.Module):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        rngs: Optional[nnx.Rngs] = None,
-        mesh: Optional[jax.sharding.Mesh] = None,
-    ):
-        # 视觉相关组件初始化
-        self.has_vision = hasattr(config, "vision_config")
-        if self.has_vision:
-            vision_config = config.vision_config
-            # 为视觉配置设置默认值
-            vision_config.num_channels = getattr(vision_config, "num_channels", 3)
-            vision_config.rms_norm_eps = getattr(
-                vision_config, "rms_norm_eps", getattr(config, "rms_norm_eps", 1e-6)
-            )
-            vision_config.hidden_size = getattr(vision_config, "hidden_size", config.hidden_size)
-            vision_config.intermediate_size = getattr(
-                vision_config, "intermediate_size", config.intermediate_size
-            )
-            vision_config.num_attention_heads = getattr(
-                vision_config, "num_attention_heads", config.num_attention_heads
-            )
-            vision_config.num_key_value_heads = getattr(
-                vision_config, "num_key_value_heads", config.num_key_value_heads
-            )
-            vision_config.max_position_embeddings = getattr(
-                vision_config, "max_position_embeddings", 1024
-            )
-
-            # 计算视觉嵌入的输入维度（基于patch size和通道数）
-            patch_size = getattr(vision_config, "patch_size", 14)
-            self.vision_embed_tokens = Embed(
-                num_embeddings=patch_size**2 * vision_config.num_channels,
-                features=vision_config.hidden_size,
-                rngs=rngs,
-                dtype=dtype,
-                kernel_axes=("tensor", None),
-                param_dtype=dtype,
-                mesh=mesh,
-            )
-
-            # 视觉位置嵌入
-            num_patches = getattr(vision_config, "num_patches", 14**2)  # 默认14x14 patches
-            self.vision_pos_embed = nnx.Param(
-                jnp.zeros((1, num_patches + 1, vision_config.hidden_size), dtype=dtype),
-                name="vision_pos_embed",
-            )
-            self.vision_norm = RMSNorm(
-                vision_config.hidden_size,
-                epsilon=vision_config.rms_norm_eps,
-                param_dtype=dtype,
-                rngs=rngs,
-            )
-            self.vision_proj = LinearBase(
-                input_size=vision_config.hidden_size,
-                output_size=config.hidden_size,
-                kernel_axes=(None, "tensor"),
-                use_bias=False,
-                params_dtype=dtype,
-                rngs=rngs,
-                mesh=mesh,
-            )
-            # 视觉解码器层
-            self.vision_layers = nnx.data(
-                [
-                    Qwen2_5VLDecoderLayer(
-                        config=vision_config,
-                        layer_id=i,
-                        dtype=dtype,
-                        rngs=rngs,
-                        mesh=mesh,
-                    )
-                    for i in range(getattr(vision_config, "depth", 0))
-                ]
-            )
-
-        # 文本嵌入层
-        self.embed_tokens = Embed(
-            num_embeddings=config.vocab_size,
-            features=config.hidden_size,
-            rngs=rngs,
-            dtype=dtype,
+        self.mlp_act = modeling_flax_utils.ACT2FN["gelu"]
+        self.mlp_fc2 = LinearBase(
+            input_size=self.hidden_size,
+            output_size=d_model,
+            use_bias=True,
             kernel_axes=("tensor", None),
-            param_dtype=dtype,
+            params_dtype=dtype,
+            rngs=rngs,
             mesh=mesh,
         )
 
-        # 解码器层
-        self.layers = nnx.data(
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x = self.ln_q(x)
+        x = x.reshape(-1, self.hidden_size)
+        x, _ = self.mlp_fc1(x)
+        x = self.mlp_act(x)
+        x, _ = self.mlp_fc2(x)
+        return x
+
+
+class Qwen2_5_VisionRotaryEmbedding(nnx.Module):
+    def __init__(self, dim: int, theta: float = 10000.0):
+        self.dim = dim
+        self.theta = theta
+
+    def __call__(self, seqlen: int) -> jax.Array:
+        inv_freq = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2, dtype=jnp.float32) / self.dim))
+        seq = jnp.arange(seqlen, dtype=jnp.float32)
+        freqs = jnp.outer(seq, inv_freq)
+        return freqs.astype(jnp.bfloat16)
+
+
+class Qwen2_5_VisionTransformer(nnx.Module):
+    def __init__(
+        self,
+        config: Qwen2_5_VLConfig,
+        dtype: jnp.dtype,
+        rngs: nnx.Rngs,
+        mesh: Mesh,
+        norm_eps: float = 1e-6,
+    ):
+        vision_config = config.vision_config
+        self.config = vision_config
+        self.dtype = dtype
+
+        self.patch_embed = Qwen2_5_VisionPatchEmbed(
+            patch_size=vision_config.patch_size,
+            temporal_patch_size=vision_config.temporal_patch_size,
+            in_channels=vision_config.in_channels,
+            hidden_size=vision_config.hidden_size,
+            dtype=dtype,
+            rngs=rngs,
+            mesh=mesh,
+        )
+
+        head_dim = vision_config.hidden_size // vision_config.num_heads
+        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+
+        self.blocks = nnx.data(
             [
-                Qwen2_5VLDecoderLayer(
+                Qwen2_5_VisionBlock(
                     config=config,
-                    layer_id=i,
                     dtype=dtype,
                     rngs=rngs,
                     mesh=mesh,
                 )
-                for i in range(config.num_hidden_layers)
+                for _ in range(vision_config.depth)
             ]
         )
 
-        # 最终归一化层
-        self.norm = RMSNorm(
-            config.hidden_size,
-            epsilon=getattr(config, "rms_norm_eps", 1e-6),
-            param_dtype=dtype,
+        self.merger = Qwen2_5_VisionPatchMerger(
+            d_model=vision_config.out_hidden_size,
+            context_dim=vision_config.hidden_size,
+            norm_layer=partial(RMSNorm, epsilon=norm_eps),
+            spatial_merge_size=vision_config.spatial_merge_size,
+            dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
-    def __call__(
-        self,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
-    ) -> Tuple[jax.Array, List[jax.Array], List[Any]]:
-        residual: Optional[jax.Array] = None
-        # 文本嵌入
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        self.window_size = vision_config.window_size
+        self.patch_size = vision_config.patch_size
+        self.spatial_merge_size = vision_config.spatial_merge_size
+        self.fullatt_block_indexes = vision_config.fullatt_block_indexes
+        self.spatial_merge_unit = self.spatial_merge_size**2
 
-        # 处理视觉输入
-        if (
-            self.has_vision
-            and hasattr(forward_batch, "vision_inputs")
-            and forward_batch.vision_inputs is not None
-        ):
-            vision_inputs = forward_batch.vision_inputs
-            # 视觉输入处理（确保输入维度正确）
-            if vision_inputs.ndim != 3:
-                raise ValueError(
-                    f"视觉输入期望3D，实际{vision_inputs.ndim}D: {vision_inputs.shape}"
-                )
-
-            vision_emb = self.vision_embed_tokens(vision_inputs)
-            # 添加位置嵌入（确保广播维度正确）
-            if vision_emb.shape[1] != self.vision_pos_embed.shape[1]:
-                logger.warning(
-                    f"视觉嵌入与位置嵌入长度不匹配: {vision_emb.shape[1]} vs {self.vision_pos_embed.shape[1]}"
-                )
-
-            vision_emb = vision_emb + self.vision_pos_embed
-            # 视觉层处理
-            vision_residual = None
-            for vision_layer in self.vision_layers:
-                vision_emb, vision_residual, _, _ = vision_layer(
-                    positions=getattr(
-                        forward_batch, "vision_positions", jnp.arange(vision_emb.shape[1])
-                    ),
-                    hidden_states=vision_emb,
-                    forward_batch=forward_batch,
-                    token_to_kv_pool=token_to_kv_pool,
-                    residual=vision_residual,
-                )
-            # 视觉归一化和投影
-            vision_emb = self.vision_norm(vision_emb)
-            vision_emb, _ = self.vision_proj(vision_emb)
-
-            # 将视觉嵌入与文本嵌入拼接（确保批次维度匹配）
-            if hidden_states.shape[0] != vision_emb.shape[0]:
-                raise ValueError(
-                    f"文本与视觉批次不匹配: {hidden_states.shape[0]} vs {vision_emb.shape[0]}"
-                )
-            hidden_states = jnp.concatenate([hidden_states, vision_emb], axis=1)
-
-        layers_kv_fused: List[jax.Array] = []
-        layers_callback_flag: List[Any] = []
-
-        # 逐层处理
-        for layer in self.layers:
-            hidden_states, residual, kv_fused, callback_flag = layer(
-                forward_batch.positions,
-                hidden_states,
-                forward_batch,
-                token_to_kv_pool,
-                residual,
+    def rotary_pos_emb_thw(self, t, h, w):
+        hpos_ids, wpos_ids = jnp.indices((h, w))
+        hpos_ids = (
+            hpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
             )
-            layers_kv_fused.append(kv_fused)
-            layers_callback_flag.extend(callback_flag)
+            .transpose(0, 2, 1, 3)
+            .flatten()
+        )
+        wpos_ids = (
+            wpos_ids.reshape(
+                h // self.spatial_merge_size,
+                self.spatial_merge_size,
+                w // self.spatial_merge_size,
+                self.spatial_merge_size,
+            )
+            .transpose(0, 2, 1, 3)
+            .flatten()
+        )
+        pos_ids = jnp.stack([hpos_ids, wpos_ids], axis=-1)
+        pos_ids = jnp.tile(pos_ids, (t, 1))
 
-        # 最终处理
-        if residual is not None:
-            hidden_states = hidden_states + residual
-        hidden_states = self.norm(hidden_states)
+        max_size = max(h, w)
+        rotary_pos_emb_full = self.rotary_pos_emb(max_size)
 
-        return hidden_states, layers_kv_fused, layers_callback_flag
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].reshape(pos_ids.shape[0], -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            rotary_pos_emb.shape[0] // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+
+        return rotary_pos_emb
+
+    def get_window_index_thw(self, grid_t, grid_h, grid_w):
+        vit_merger_window_size = self.window_size // self.spatial_merge_size // self.patch_size
+
+        llm_grid_h = grid_h // self.spatial_merge_size
+        llm_grid_w = grid_w // self.spatial_merge_size
+
+        index = jnp.arange(grid_t * llm_grid_h * llm_grid_w).reshape(grid_t, llm_grid_h, llm_grid_w)
+
+        pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
+        pad_w = vit_merger_window_size - llm_grid_w % vit_merger_window_size
+        num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
+        num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
+
+        index_padded = jnp.pad(index, ((0, 0), (0, pad_h), (0, pad_w)), constant_values=-100)
+        index_padded = index_padded.reshape(
+            grid_t, num_windows_h, vit_merger_window_size, num_windows_w, vit_merger_window_size
+        )
+        index_padded = jnp.transpose(index_padded, (0, 1, 3, 2, 4)).reshape(
+            grid_t, num_windows_h * num_windows_w, vit_merger_window_size, vit_merger_window_size
+        )
+        seqlens = (index_padded != -100).sum([2, 3]).reshape(-1)
+        index_padded = index_padded.reshape(-1)
+        num_valid_indices = grid_t * llm_grid_h * llm_grid_w
+        valid_indices = jnp.nonzero(index_padded != -100, size=num_valid_indices)[0]
+        index_new = index_padded[valid_indices]
+        cu_seqlens_tmp = jnp.cumsum(seqlens) * self.spatial_merge_unit
+        cu_seqlens_tmp = cu_seqlens_tmp.astype(jnp.int32)
+
+        return index_new, cu_seqlens_tmp
+
+    def get_rope_by_thw(self, t, h, w):
+        window_index_thw, cu_seqlens_window_thw = self.get_window_index_thw(t, h, w)
+
+        rotary_pos_emb_thw = self.rotary_pos_emb_thw(t, h, w)
+
+        rotary_pos_emb_thw = rotary_pos_emb_thw[window_index_thw, :, :]
+        rotary_pos_emb_thw = rotary_pos_emb_thw.reshape(-1, rotary_pos_emb_thw.shape[-1])
+        cu_seqlens_thw = jnp.full(t, h * w, dtype=jnp.int32)
+
+        return (rotary_pos_emb_thw, window_index_thw, cu_seqlens_window_thw, cu_seqlens_thw)
+
+    def compute_aux_arrays(self, grid_thw: tuple[tuple[int, int, int]]):
+        num_grids = len(grid_thw)
+
+        rotary_pos_emb = []
+        window_index: list = []
+        cu_window_seqlens: list = [jnp.array([0], dtype=jnp.int32)]
+        cu_seqlens: list = []
+
+        window_index_id = 0
+        cu_window_seqlens_last = 0
+        for i in range(num_grids):
+            t, h, w = grid_thw[i]
+
+            llm_h = h // self.spatial_merge_size
+            llm_w = w // self.spatial_merge_size
+
+            (
+                rotary_pos_emb_thw,
+                window_index_thw,
+                cu_seqlens_window_thw,
+                cu_seqlens_thw,
+            ) = self.get_rope_by_thw(t, h, w)
+
+            window_index.append(window_index_thw + window_index_id)
+            window_index_id += t * llm_h * llm_w
+
+            cu_seqlens_window_thw = cu_seqlens_window_thw + cu_window_seqlens_last
+            cu_window_seqlens_last = cu_seqlens_window_thw[-1]
+            cu_window_seqlens.append(cu_seqlens_window_thw)
+
+            rotary_pos_emb.append(rotary_pos_emb_thw)
+
+            cu_seqlens.append(cu_seqlens_thw)
+
+        rotary_pos_emb = jnp.concatenate(rotary_pos_emb, axis=0)
+        window_index = jnp.concatenate(window_index, axis=0)
+        cu_window_seqlens = jnp.concatenate(cu_window_seqlens, axis=0)
+
+        cu_seqlens = jnp.concatenate(cu_seqlens, axis=0)
+        cu_seqlens = jnp.cumsum(cu_seqlens, axis=0, dtype=jnp.int32)
+        cu_seqlens = jnp.pad(cu_seqlens, ((1, 0),), mode="constant", constant_values=0)
+        return window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens
+
+    def compute_hidden_states(
+        self,
+        x: jax.Array,
+        window_index: jax.Array,
+        rotary_pos_emb: jax.Array,
+        cu_seqlens: jax.Array,
+        cu_window_seqlens: jax.Array,
+    ) -> jax.Array:
+        hidden_states = self.patch_embed(x)
+
+        seq_len = x.shape[0]
+        hidden_states = hidden_states.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+        hidden_states = hidden_states[window_index, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
+        hidden_states = jnp.expand_dims(hidden_states, axis=1)
+
+        for layer_num, blk in enumerate(self.blocks):
+            if layer_num in self.fullatt_block_indexes:
+                hidden_states = blk(
+                    hidden_states,
+                    rotary_pos_emb=rotary_pos_emb,
+                    cu_window_seqlens=cu_seqlens,
+                    use_fullattn=True,
+                )
+            else:
+                hidden_states = blk(
+                    hidden_states,
+                    rotary_pos_emb=rotary_pos_emb,
+                    cu_window_seqlens=cu_window_seqlens,
+                    use_fullattn=False,
+                )
+
+        hidden_states = self.merger(hidden_states)
+        reverse_indices = jnp.argsort(window_index)
+        hidden_states = hidden_states[reverse_indices, :]
+        return hidden_states
+
+    def __call__(self, x: jax.Array, grid_thw: tuple[tuple[int, int, int]]) -> jax.Array:
+        window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens = self.compute_aux_arrays(
+            grid_thw
+        )
+        return self.compute_hidden_states(
+            x, window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens
+        )
 
 
 class Qwen2_5_VLForConditionalGeneration(nnx.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        config: Qwen2_5_VLConfig,
         dtype: jnp.dtype = jnp.bfloat16,
-        rngs: Optional[nnx.Rngs] = None,
-        mesh: Optional[jax.sharding.Mesh] = None,
-    ):
-        self.model = Qwen2_5VLModel(config, dtype=dtype, rngs=rngs, mesh=mesh)
-        # 词嵌入共享配置
-        self.tie_word_embeddings = getattr(config, "tie_word_embeddings", True)
-        if not self.tie_word_embeddings:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                dtype=dtype,
-                param_dtype=dtype,
-                kernel_axes=("tensor", None),
-                rngs=rngs,
-            )
-        else:
-            self.lm_head = None  # 共享时使用嵌入层权重
-
+        rngs: nnx.Rngs = None,
+        mesh: Mesh = None,
+    ) -> None:
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
         self.config = config
         self.dtype = dtype
         self.mesh = mesh
+
+        self.visual = Qwen2_5_VisionTransformer(
+            config=config,
+            dtype=dtype,
+            rngs=rngs,
+            mesh=mesh,
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+        )
+        self.language_model = Qwen2ForCausalLM(
+            config=config,
+            dtype=dtype,
+            rngs=rngs,
+            mesh=mesh,
+        )
         logger.info(f"Qwen2.5VLForCausalLM initialized with dtype {dtype}")
 
     def load_weights(self, model_config: ModelConfig, rng_key: jax.Array) -> None:
@@ -577,46 +604,39 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
 
     def _create_qwen2_5_vl_weight_mappings(self) -> dict:
         mappings = {
-            # Text embedding
+            # Text embedding - 修正路径，添加language_model前缀
             "model.embed_tokens.weight": WeightMapping(
-                target_path="model.embed_tokens.embedding",
+                target_path="language_model.model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            # Final norm
+            # Final norm - 修正路径，添加language_model前缀
             "model.norm.weight": WeightMapping(
-                target_path="model.norm.scale",
+                target_path="language_model.model.norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
         }
 
-        # Vision mappings if available
-        if self.model.has_vision:
-            # 修正视觉嵌入层权重路径映射
+        # Vision mappings (检查视觉模型是否存在)
+        if hasattr(self, "visual"):
             mappings.update(
                 {
-                    # Vision embedding (修正权重路径)
-                    "model.vision_model.embed_tokens.weight": WeightMapping(
-                        target_path="model.vision_embed_tokens.embedding",
+                    # Vision embedding - 修正视觉模型路径
+                    "vision_model.embed_tokens.weight": WeightMapping(
+                        target_path="visual.patch_embed.proj.weight",
                         sharding=("tensor", None),
                         transpose=False,
                     ),
-                    # Vision position embedding
-                    "model.vision_model.pos_embed": WeightMapping(
-                        target_path="model.vision_pos_embed",
-                        sharding=(None, None),
-                        transpose=False,
-                    ),
-                    # Vision norm (修正权重路径)
-                    "model.vision_model.norm.weight": WeightMapping(
-                        target_path="model.vision_norm.scale",
+                    # Vision norm - 修正路径
+                    "vision_model.norm.weight": WeightMapping(
+                        target_path="visual.merger.ln_q.scale",
                         sharding=(None,),
                         transpose=False,
                     ),
                     # Vision projection
-                    "model.vision_proj.weight": WeightMapping(
-                        target_path="model.vision_proj.weight",
+                    "vision_proj.weight": WeightMapping(
+                        target_path="visual.merger.mlp_fc2.weight",
                         sharding=(None, "tensor"),
                         transpose=True,
                     ),
@@ -624,21 +644,21 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             )
 
         # LM head mapping if not tying word embeddings
-        if not getattr(self.config, "tie_word_embeddings", False) and self.lm_head is not None:
+        if not getattr(self.config, "tie_word_embeddings", False) and hasattr(self.language_model, "lm_head"):
             mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding",
+                target_path="language_model.lm_head.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             )
 
-        # Text layers mappings
+        # Text layers mappings - 注意添加language_model前缀
         num_text_layers = self.config.num_hidden_layers
         for layer_idx in range(num_text_layers):
             text_layer_mappings = self._create_text_layer_mappings(layer_idx)
             mappings.update(text_layer_mappings)
 
         # Vision layers mappings
-        if self.model.has_vision and hasattr(self.config, "vision_config"):
+        if hasattr(self.config, "vision_config"):
             num_vision_layers = getattr(self.config.vision_config, "depth", 0)
             for layer_idx in range(num_vision_layers):
                 vision_layer_mappings = self._create_vision_layer_mappings(layer_idx)
@@ -655,7 +675,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
 
     def _create_text_layer_mappings(self, layer_idx: int) -> dict:
         prefix = f"model.layers.{layer_idx}"
-        target_prefix = f"model.layers.{layer_idx}"
+        target_prefix = f"language_model.model.layers.{layer_idx}"
 
         mappings = {
             f"{prefix}.input_layernorm.weight": WeightMapping(
@@ -871,33 +891,293 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
 
         return mappings
 
-    @nnx.jit
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        image_grid_thw,
+        video_grid_thw,
+        second_per_grid_ts: list[float],
+        context_len: int = 0,
+        seq_len: int | None = None,
+    ) -> tuple[jax.Array, int]:
+        image_token_id = self.config.image_token_id
+        video_token_id = self.config.video_token_id
+        vision_start_token_id = self.config.vision_start_token_id
+        spatial_merge_size = self.config.vision_config.spatial_merge_size
+        tokens_per_second = getattr(self.config.vision_config, "tokens_per_second", 1.0)
+
+        input_tokens_tensor = np.array(input_tokens)
+        vision_start_indices = np.argwhere(input_tokens_tensor == vision_start_token_id).squeeze(1)
+        vision_tokens = input_tokens_tensor[vision_start_indices + 1]
+        image_nums = np.sum(vision_tokens == image_token_id)
+        video_nums = np.sum(vision_tokens == video_token_id)
+        llm_pos_ids_list: list = []
+
+        st = 0
+        remain_images, remain_videos = image_nums, video_nums
+
+        image_index, video_index = 0, 0
+        for _ in range(image_nums + video_nums):
+            video_second_per_grid_t = 0.0
+            if remain_images > 0:
+                try:
+                    ed_image = input_tokens.index(image_token_id, st)
+                except ValueError:
+                    ed_image = len(input_tokens) + 1
+            else:
+                ed_image = len(input_tokens) + 1
+            if remain_videos > 0:
+                try:
+                    ed_video = input_tokens.index(video_token_id, st)
+                except ValueError:
+                    ed_video = len(input_tokens) + 1
+            else:
+                ed_video = len(input_tokens) + 1
+            if ed_image < ed_video:
+                t, h, w = (
+                    image_grid_thw[image_index][0],
+                    image_grid_thw[image_index][1],
+                    image_grid_thw[image_index][2],
+                )
+                image_index += 1
+                remain_images -= 1
+                ed = ed_image
+            else:
+                t, h, w = (
+                    video_grid_thw[video_index][0],
+                    video_grid_thw[video_index][1],
+                    video_grid_thw[video_index][2],
+                )
+                video_second_per_grid_t = 1.0
+                if second_per_grid_ts:
+                    video_second_per_grid_t = second_per_grid_ts[video_index]
+                video_index += 1
+                remain_videos -= 1
+                ed = ed_video
+
+            llm_grid_t, llm_grid_h, llm_grid_w = (
+                t,
+                h // spatial_merge_size,
+                w // spatial_merge_size,
+            )
+            text_len = ed - st
+
+            st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
+            llm_pos_ids_list.append(
+                jnp.broadcast_to(
+                    jnp.arange(text_len, dtype=jnp.int32).reshape(1, -1), (3, text_len)
+                )
+                + st_idx
+            )
+
+            t_index = (
+                (
+                    jnp.broadcast_to(
+                        jnp.arange(llm_grid_t, dtype=jnp.int32).reshape(-1, 1),
+                        (llm_grid_t, llm_grid_h * llm_grid_w),
+                    )
+                    * video_second_per_grid_t
+                    * tokens_per_second
+                )
+                .astype(jnp.int32)
+                .flatten()
+            )
+
+            h_index = jnp.broadcast_to(
+                jnp.arange(llm_grid_h, dtype=jnp.int32).reshape(1, -1, 1),
+                (llm_grid_t, llm_grid_h, llm_grid_w),
+            ).flatten()
+            w_index = jnp.broadcast_to(
+                jnp.arange(llm_grid_w, dtype=jnp.int32).reshape(1, 1, -1),
+                (llm_grid_t, llm_grid_h, llm_grid_w),
+            ).flatten()
+
+            llm_pos_ids_list.append(jnp.stack([t_index, h_index, w_index]) + text_len + st_idx)
+            st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+
+        if st < len(input_tokens):
+            st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
+            text_len = len(input_tokens) - st
+
+            llm_pos_ids_list.append(
+                jnp.broadcast_to(
+                    jnp.arange(text_len, dtype=jnp.int32).reshape(1, -1), (3, text_len)
+                )
+                + st_idx
+            )
+
+        llm_positions = jnp.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
+        mrope_position_delta = (llm_positions.max() + 1 - len(input_tokens)).item()
+        llm_positions = llm_positions[:, context_len:seq_len]
+
+        return llm_positions, mrope_position_delta
+
+    def _validate_and_reshape_mm_tensor(self, mm_input: object, name: str) -> jax.Array:
+        if isinstance(mm_input, list):
+            arrays_to_concat = [jnp.asarray(item) for item in mm_input]
+            return jnp.concatenate(arrays_to_concat, axis=0)
+
+        if hasattr(mm_input, "ndim"):
+            array_input = jnp.asarray(mm_input)
+            if array_input.ndim == 2:
+                return array_input
+            if array_input.ndim == 3:
+                return array_input.reshape(-1, array_input.shape[-1])
+
+        raise ValueError(f"Incorrect type of {name}. " f"Got type: {type(mm_input)}")
+
+    def _parse_and_validate_image_input(
+        self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
+    ) -> Optional[Qwen2_5_VLImageInputs]:
+        pixel_values = kwargs.pop("pixel_values", None)
+        image_embeds = kwargs.pop("image_embeds", None)
+
+        if pixel_values is None and image_embeds is None:
+            return None
+
+        if pixel_values is not None:
+            pixel_values = self._validate_and_reshape_mm_tensor(pixel_values, "image pixel values")
+            return Qwen2_5_VLImagePixelInputs(
+                type="pixel_values", pixel_values=pixel_values, image_grid_thw=image_grid_thw
+            )
+
+        return None
+
+    def _parse_and_validate_multimodal_inputs(
+        self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
+    ) -> dict:
+        mm_input_by_modality = {}
+
+        for input_key in kwargs:
+            if (
+                input_key in ("pixel_values", "image_embeds")
+                and "image" not in mm_input_by_modality
+            ):
+                mm_input_by_modality["image"] = self._parse_and_validate_image_input(
+                    image_grid_thw, **kwargs
+                )
+        return mm_input_by_modality
+
+    def get_single_image_embedding(self, image_pixel_values, image_grid_thw):
+        return self.visual(image_pixel_values, (image_grid_thw,))
+
+    def _process_image_input(self, image_input: Qwen2_5_VLImageInputs) -> tuple[jax.Array, ...]:
+
+        grid_thw = image_input["image_grid_thw"]
+
+        if image_input["type"] == "image_embeds":
+            image_embeds = image_input["image_embeds"].astype(self.visual.dtype)
+        else:
+            pixel_values = image_input["pixel_values"]
+            image_embeds = []
+            current_idx = 0
+            for image_thw in grid_thw:
+                t, h, w = image_thw
+                image_size = t * h * w
+                end_idx = current_idx + image_size
+                image_pixel_values = pixel_values[current_idx:end_idx, :]
+                image_embeds.append(self.get_single_image_embedding(image_pixel_values, image_thw))
+                current_idx = end_idx
+            image_embeds = jnp.concatenate(image_embeds, axis=0)
+
+        merge_size = self.visual.config.spatial_merge_size
+        sizes = np.prod(np.array(grid_thw, dtype=np.int64), axis=-1) // merge_size // merge_size
+
+        if sizes.size == 0:
+            return ()
+        if sizes.size == 1:
+            return (image_embeds,)
+
+        split_indices = np.cumsum(sizes)[:-1]
+        return tuple(jnp.split(image_embeds, split_indices))
+
+    def get_multimodal_embeddings(
+        self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
+    ) -> List[jax.Array]:
+        mm_input_by_modality = self._parse_and_validate_multimodal_inputs(image_grid_thw, **kwargs)
+        if not mm_input_by_modality:
+            return []
+
+        multimodal_embeddings: tuple[jax.Array, ...] = ()
+
+        for modality in mm_input_by_modality:
+            multimodal_input = mm_input_by_modality[modality]
+            if modality == "image":
+                vision_embeddings = self._process_image_input(multimodal_input)
+                multimodal_embeddings += vision_embeddings
+
+        return list(multimodal_embeddings)
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         logits_metadata: LogitsMetadata,
-    ) -> Tuple[jax.Array, List[jax.Array], List[Any]]:
-        # 自动设备放置
-        if self.mesh is not None:
-            with self.mesh:
-                hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-                    forward_batch=forward_batch,
-                    token_to_kv_pool=token_to_kv_pool,
-                )
-        else:
-            hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-                forward_batch=forward_batch,
-                token_to_kv_pool=token_to_kv_pool,
+        input_embeds: Optional[List[jax.Array]] = None,
+    ):
+        hidden_states = self.language_model.model.embed_tokens(forward_batch.input_ids)
+
+        if False: # input_embeds:
+            # 新增：校验类型，确保是可迭代的嵌入数据
+            if not isinstance(input_embeds, (list, np.ndarray, jnp.ndarray)):
+                raise TypeError(f"Expected list/array for multimodal_embeddings, got {type(input_embeds)}")
+
+            input_ids = forward_batch.input_ids
+            image_token_id = self.config.image_token_id
+            video_token_id = self.config.video_token_id
+
+            img_mask = (input_ids == image_token_id) | (input_ids == video_token_id)
+
+            # 处理输入维度（2D为批量，1D为单条）
+            if input_ids.ndim == 2:
+                max_seq_len = input_ids.shape[1]
+                dim_index = 1
+            else:
+                max_seq_len = input_ids.size
+                dim_index = 0
+
+            # 获取图像/视频令牌的位置，用-1填充无效位置
+            img_indices = jnp.where(img_mask, size=max_seq_len, fill_value=-1)[dim_index]
+
+            # 生成有效位置索引（固定长度，-1表示无效）
+            all_valid_mask = img_indices != -1
+            valid_positions = jnp.where(all_valid_mask, jnp.arange(max_seq_len), -1)
+
+            # 限制有效索引数量不超过嵌入数量（避免索引越界）
+            num_embeddings = len(input_embeds)
+            valid_indices = valid_positions[:num_embeddings]
+
+            # 向量化更新隐藏状态（替代循环，更符合JAX特性）
+            # 1. 过滤无效索引（-1）
+            valid_mask = valid_indices != -1
+            valid_idx = valid_indices[valid_mask]
+            valid_embeds = jnp.array(input_embeds)[valid_mask]
+
+            # 2. 批量更新隐藏状态
+            if valid_idx.size > 0:
+                hidden_states = hidden_states.at[:, valid_idx, :].set(valid_embeds)
+
+        residual = None
+        layers_kv_fused = []
+        layers_callback_flag = []
+        for layer in self.language_model.model.layers:
+            hidden_states, residual, kv_fused, callback_flag = layer(
+                forward_batch.positions,
+                hidden_states,
+                forward_batch,
+                token_to_kv_pool,
+                residual,
             )
+            layers_kv_fused.append(kv_fused)
+            layers_callback_flag.extend(callback_flag)
 
-        # 计算logits
-        if not self.tie_word_embeddings and self.lm_head is not None:
-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
-        else:
-            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
+        if residual is not None:
+            hidden_states += residual
+        hidden_states = self.language_model.model.norm(hidden_states)
 
-        return output, layers_kv_fused, layers_callback_flag
+        logits = self.logits_processor(hidden_states, self.language_model.model.embed_tokens, logits_metadata)
+
+        return logits, layers_kv_fused, layers_callback_flag
 
 
 # 注册模型入口类

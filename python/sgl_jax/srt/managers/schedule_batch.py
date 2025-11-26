@@ -1935,6 +1935,9 @@ class ModelWorkerBatch:
 
     tree_cache: BasePrefixCache = None
 
+    # The input Embeds
+    input_embeds: Optional[np.ndarray] = None
+
     def padding_model_worker_batch(
         self,
         token_paddings: list,

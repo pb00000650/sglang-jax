@@ -149,7 +149,9 @@ class Scheduler(
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
         self.enable_overlap = not server_args.disable_overlap_schedule
-        self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(
+            server_args.speculative_algorithm
+        )
         # Init inter-process communication
         context = zmq.Context(2)
 

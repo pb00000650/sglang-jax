@@ -98,6 +98,7 @@ class ModelRunner:
 
         # For sampling
         self.use_sort_for_toppk_minp = server_args.use_sort_for_toppk_minp
+        self.is_multimodal = model_config.is_multimodal
 
         # Global vars
         global_server_args_dict.update(
@@ -472,7 +473,7 @@ class ModelRunner:
             )
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
-
+    # 新增：处理多模态前向传播的方法
     def _forward(
         self,
         forward_batch: ForwardBatch,
@@ -637,6 +638,7 @@ class MockModelRunner(ModelRunner):
     ):
         self.server_args = server_args
         self.tp_size = server_args.tp_size
+        self.is_multimodal = model_config.is_multimodal
 
         if isinstance(model_config, MockModelConfig):
             self.num_kv_heads = model_config.num_kv_heads

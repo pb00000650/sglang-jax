@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import jax
 from jax.sharding import NamedSharding, PartitionSpec
@@ -155,6 +155,9 @@ class ForwardBatch:
 
     cache_loc: jax.Array = None
 
+    # For input embeddings
+    input_embeds: Optional[jax.Array] = None
+
     # For extend
     extend_prefix_lens: jax.Array | None = None
     extend_seq_lens: jax.Array | None = None
@@ -286,6 +289,7 @@ class ForwardBatch:
             spec_info=batch.spec_info,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
+            input_embeds=batch.input_embeds,
         )
 
         return obj

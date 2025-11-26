@@ -36,6 +36,7 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
+        logger.info(f"开始处理prefill批次，批次ID: {result.bid}, 请求数量: {len(batch.reqs)}")
         skip_stream_req = None
 
         assert self.is_generation
@@ -52,13 +53,21 @@ class SchedulerOutputProcessorMixin:
             result.extend_logprob_start_len_per_req,
             result.cache_miss_count,
         )
+        logger.info(f"从结果中获取的next_token_ids: {next_token_ids}")
+        logger.info(f"logits_output是否存在: {logits_output is not None}")
         if self.enable_overlap:
+            logger.info("进入overlap模式，解析最后批次结果")
+            logits_output, next_token_ids, cache_miss_count = (
+                self.tp_worker.resolve_last_batch_result(launch_done)
+            )
+            logger.info(f"overlap模式解析后next_token_ids: {next_token_ids}")
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )
         else:
             # Move next_token_ids and logprobs to cpu
             if batch.return_logprob:
+                logger.info("非overlap模式，迁移logprobs到CPU")
                 if logits_output.next_token_logprobs is not None:
                     logits_output.next_token_logprobs = jax.device_get(
                         logits_output.next_token_logprobs
@@ -70,20 +79,25 @@ class SchedulerOutputProcessorMixin:
         # Check finish conditions
         logprob_pt = 0
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+            logger.info(f"处理请求索引{i}，请求ID: {req.rid}, next_token_id: {next_token_id}")
             if req.is_retracted:
+                logger.info(f"请求{req.rid}已被撤回，跳过处理")
                 continue
 
             if self.is_mixed_chunk and self.enable_overlap and req.finished():
+                logger.info(f"请求{req.rid}已完成，释放缓存位置")
                 j = len(batch.out_cache_loc) - len(batch.reqs) + i
                 self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
                 continue
 
             if req.is_chunked <= 0:
+                logger.info(f"请求{req.rid}添加token: {next_token_id}，当前output_ids长度: {len(req.output_ids)+1}")
                 # req output_ids are set here
                 req.output_ids.append(next_token_id)
                 req.check_finished()
 
                 if req.finished():
+                    logger.info(f"请求{req.rid}已完成，finished_reason: {req.finished_reason}")
                     if precision_tracer.get_trace_active():
                         precision_tracer.set_request_status_to_completed(req.rid)
                         precision_tracer.add_completed_requests_count()
@@ -101,10 +115,12 @@ class SchedulerOutputProcessorMixin:
                             precision_tracer.stop_trace()
                     self.tree_cache.cache_finished_req(req)
                 elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    logger.info(f"请求{req.rid}未完成，继续处理")
                     # This updates radix so others can match
                     self.tree_cache.cache_unfinished_req(req)
 
                 if req.return_logprob:
+                    logger.info(f"请求{req.rid}处理日志概率，起始位置: {extend_logprob_start_len_per_req[i]}")
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
@@ -137,6 +153,7 @@ class SchedulerOutputProcessorMixin:
                         self.abort_request(AbortReq(rid=req.rid))
                     req.grammar.finished = req.finished()
             else:
+                logger.info(f"请求{req.rid}处于分块处理中，剩余分块数: {req.is_chunked-1}")
                 # being chunked reqs' prefill is not finished
                 req.is_chunked -= 1
                 # There is only at most one request being currently chunked.
@@ -161,13 +178,14 @@ class SchedulerOutputProcessorMixin:
                         )
                         logprob_pt += num_input_logprobs
 
+        logger.info(f"prefill批次处理完成，缓存未命中数量: {cache_miss_count}")
         batch.cache_miss_count = cache_miss_count
 
         if batch.cache_miss_count > 0:
             logger.info("Prefill batch. #bid: %s, #cache_miss: %s", result.bid, cache_miss_count)
 
         self.set_next_batch_sampling_info_done(batch)
-
+        logger.info(f"准备流输出，跳过的请求: {skip_stream_req.rid if skip_stream_req else None}")
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req, cache_miss_count)
 
         batch.spec_info = result.next_draft_input
@@ -195,20 +213,28 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
+        logger.info(f"开始处理decode批次，批次ID: {getattr(result, 'bid', 'unknown')}, 请求数量: {len(batch.reqs)}")
         logits_output, next_token_ids, cache_miss_count = (
             result.logits_output,
             result.next_token_ids,
             result.cache_miss_count,
         )
+        logger.info(f"初始next_token_ids: {next_token_ids}, 长度: {len(next_token_ids) if isinstance(next_token_ids, list) else '未知'}")
+        logger.info(f"logits_output是否存在: {logits_output is not None}")
         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            logger.info(f"使用推测性解码算法: {self.spec_algorithm}")
             next_token_ids = self._resolve_spec_decode_token_ids(result=result, batch=batch)
+            logger.info(f"推测性解码处理后next_token_ids: {next_token_ids}")
 
             # allocate_lens_list = result.allocate_lens.tolist()
             # accept_lens_list = result.accept_lens.tolist()
 
         if self.spec_algorithm is None or self.spec_algorithm.is_none():
+            logger.info(f"非推测模式，新增生成token数: {len(batch.reqs)}")
             self.num_generated_tokens += len(batch.reqs)
         else:
+            total_accepted = sum(len(ids) for ids in next_token_ids)
+            logger.info(f"推测模式，总接受token数: {total_accepted}, 总draft token数: {len(batch.reqs) * self.draft_worker.speculative_num_draft_tokens}")
             for next_token_id in next_token_ids:
                 self.num_generated_tokens += len(next_token_id)
                 self.accept_token += len(next_token_id)
@@ -217,23 +243,32 @@ class SchedulerOutputProcessorMixin:
         # FIXME(pc) add spec decode metrics
 
         if self.enable_overlap:
+            logger.info("进入overlap模式，解析最后批次结果")
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )
+            logger.info(f"overlap模式解析后next_token_ids: {next_token_ids}, 缓存未命中数: {cache_miss_count}")
             next_token_logprobs = logits_output.next_token_logprobs
+            logger.info(f"overlap模式下next_token_logprobs: {next_token_logprobs is not None}")
         else:
             # spec decoding handles output logprobs inside verify process.
             if batch.return_logprob:
                 next_token_logprobs = jax.device_get(logits_output.next_token_logprobs).astype(
                     float
                 )
-
+                logger.info(f"非overlap模式，logprobs形状: {next_token_logprobs.shape if next_token_logprobs is not None else 'None'}")
+            else:
+                logger.info("非overlap模式，不返回logprobs")
         self.token_to_kv_pool_allocator.free_group_begin()
 
+        logger.info(f"开始处理{len(batch.reqs)}个请求的解码结果")
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
+            logger.info(f"处理请求索引{i}，请求ID: {req.rid}, 当前output_ids长度: {len(req.output_ids)}")
+
             if req.is_retracted:
+                logger.info(f"请求{req.rid}已被撤回，跳过处理")
                 continue
 
             indices_to_free = None
@@ -245,12 +280,15 @@ class SchedulerOutputProcessorMixin:
                         indices_to_free = batch.out_cache_loc[i : i + 1]
                 if indices_to_free is not None:
                     self.token_to_kv_pool_allocator.free(indices_to_free)
+                logger.info(f"请求{req.rid}已完成，准备释放缓存")
                 continue
 
             new_accepted_len = 1
             if batch.spec_algorithm is None or batch.spec_algorithm.is_none():
+                logger.info(f"非推测模式，添加token: {next_token_id}")
                 req.output_ids.append(next_token_id)
             elif self.spec_algorithm.is_eagle():
+                logger.info(f"Eagle模式，添加token序列: {next_token_id} (长度: {len(next_token_id)})")
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
@@ -289,11 +327,13 @@ class SchedulerOutputProcessorMixin:
                         >= precision_tracer.get_max_requests()
                     ):
                         precision_tracer.stop_trace()
+                logger.info(f"请求{req.rid}处理完成，finish_reason: {req.finished_reason}, 最终output_ids长度: {len(req.output_ids)}")
                 self.tree_cache.cache_finished_req(req)
 
             if req.return_logprob and (
                 batch.spec_algorithm is None or batch.spec_algorithm.is_none()
             ):
+                logger.info(f"请求{req.rid}记录logprobs，当前output_token_logprobs长度: {len(req.output_token_logprobs_val) + 1}")
                 # speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
@@ -312,6 +352,7 @@ class SchedulerOutputProcessorMixin:
             if req.grammar is not None:
                 try:
                     req.grammar.accept_token(int(next_token_id))
+                    logger.info(f"请求{req.rid}语法校验通过，token: {next_token_id}")
                 except ValueError as e:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
@@ -326,6 +367,7 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(logits_output.hidden_states[i])
+        logger.info(f"准备流输出，批次缓存未命中数: {cache_miss_count}")
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(batch.reqs, batch.return_logprob, cache_miss_count=cache_miss_count)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -337,6 +379,7 @@ class SchedulerOutputProcessorMixin:
             self.forward_ct_decode % self.server_args.decode_log_interval == 0
             or batch.cache_miss_count > 0
         ):
+            logger.info(f"触发解码统计日志，批次缓存未命中数: {cache_miss_count}")
             self.log_decode_stats(running_batch=batch)
 
     def add_input_logprob_return_values(
